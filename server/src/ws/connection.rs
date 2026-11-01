@@ -10,7 +10,7 @@ use futures_util::SinkExt;
 use serde_json::{json, Value};
 
 use crate::api::{self, CallContext, ServerContext};
-use crate::protocol::events::{Event, EventSubscriptions};
+use crate::protocol::events::{Event, EventClass, EventSubscriptions};
 use crate::protocol::message::{response_envelope, Request};
 
 use super::http::{self, Prefixed, RequestHead};
@@ -60,7 +60,7 @@ where
     };
 
     let connection_id = next_connection_id();
-    let mut subscriptions = EventSubscriptions::default();
+    let mut subscriptions = EventSubscriptions::for_connection(connection_id);
     // Subscribe before the greeting so no event is missed between the two.
     let events = context.events.subscribe();
 
@@ -96,10 +96,75 @@ where
                 if text.trim().is_empty() {
                     continue;
                 }
-                let response =
-                    handle_request(&text, &context, connection_id, &peer, &mut subscriptions).await;
+                let request = match parse_request(&text, &mut subscriptions) {
+                    Ok(request) => request,
+                    Err(response) => {
+                        let encoded = serde_json::to_string(&response).unwrap_or_default();
+                        if websocket.send(Message::Text(encoded)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                // A command can hold this connection for minutes
+                // (commissioning does), and the progress it reports is only
+                // useful if it arrives before the response. So the event
+                // stream is drained while the request runs: progress addressed
+                // to this connection goes out at once, and everything else is
+                // held and sent after the response, in the order clients have
+                // always seen it.
+                let mut running =
+                    std::pin::pin!(run_request(request, &context, connection_id, &peer));
+                let mut deferred = Vec::new();
+                let response = loop {
+                    let done = async { Racing::Done(running.as_mut().await) };
+                    let event = async { Racing::Event(events.recv().await.ok()) };
+                    match futures_lite::future::or(done, event).await {
+                        Racing::Done(response) => break Some(response),
+                        Racing::Event(Some(event)) => {
+                            if !subscriptions.accepts(&event) {
+                                continue;
+                            }
+                            if !matches!(event.class, EventClass::Requester(_)) {
+                                if deferred.len() >= MAX_DEFERRED_EVENTS {
+                                    log::warn!(
+                                        "{}: too many events queued behind a request; closing so the client can re-sync",
+                                        peer
+                                    );
+                                    break None;
+                                }
+                                deferred.push(event);
+                                continue;
+                            }
+                            let encoded = serde_json::to_string(&event.payload).unwrap_or_default();
+                            if websocket.send(Message::Text(encoded)).await.is_err() {
+                                break None;
+                            }
+                        }
+                        Racing::Event(None) => {
+                            log::warn!(
+                                "{}: dropped from the event stream mid-request; closing so the client can re-sync",
+                                peer
+                            );
+                            break None;
+                        }
+                    }
+                };
+                let Some(response) = response else { break };
                 let encoded = serde_json::to_string(&response).unwrap_or_default();
                 if websocket.send(Message::Text(encoded)).await.is_err() {
+                    break;
+                }
+                let mut closed = false;
+                for event in deferred {
+                    let encoded = serde_json::to_string(&event.payload).unwrap_or_default();
+                    if websocket.send(Message::Text(encoded)).await.is_err() {
+                        closed = true;
+                        break;
+                    }
+                }
+                if closed {
                     break;
                 }
             }
@@ -139,7 +204,19 @@ enum Incoming {
     Event(Option<Event>),
 }
 
+/// How many events are held behind a running request before the connection
+/// is treated as unable to keep up — the same bound the event bus puts on a
+/// connection's queue when no request is running.
+const MAX_DEFERRED_EVENTS: usize = 256;
+
+/// A running request, or an event that arrived while it ran.
+enum Racing {
+    Done(Value),
+    Event(Option<Event>),
+}
+
 /// Parse, dispatch, and envelope one request.
+#[cfg(test)]
 async fn handle_request(
     text: &str,
     context: &Arc<ServerContext>,
@@ -147,39 +224,64 @@ async fn handle_request(
     peer: &str,
     subscriptions: &mut EventSubscriptions,
 ) -> Value {
+    match parse_request(text, subscriptions) {
+        Ok(request) => run_request(request, context, connection_id, peer).await,
+        Err(response) => response,
+    }
+}
+
+/// Decode one frame and latch the opt-ins its command implies.
+///
+/// Split from [`run_request`] so the subscriptions are no longer borrowed
+/// while the request runs: the connection loop reads them to forward events
+/// in the meantime. A frame that cannot be run is answered with the error
+/// envelope directly.
+fn parse_request(text: &str, subscriptions: &mut EventSubscriptions) -> Result<Request, Value> {
     let Ok(raw) = serde_json::from_str::<Value>(text) else {
         // There is no message id to correlate a malformed frame with, so the
         // error is reported against the empty id the protocol uses.
-        return json!({
+        return Err(json!({
             "message_id": "",
             "error_code": crate::protocol::ErrorCode::InvalidArguments.as_i64(),
             "details": "Invalid JSON",
-        });
+        }));
     };
 
     let request = Request::from_value(&raw);
-    let Some(command) = request.command.clone() else {
-        return response_envelope(
+    let Some(command) = request.command.as_deref() else {
+        return Err(response_envelope(
             &request.message_id,
             Err(crate::protocol::ApiError::new(
                 crate::protocol::ErrorCode::InvalidCommand,
                 "Missing command",
             )),
-        );
+        ));
     };
 
     // Opt-ins latch on the attempt, not on success: issuing the command is
     // what proves the client understands the event family.
-    subscriptions.observe_command(&command);
+    subscriptions.observe_command(command);
+    Ok(request)
+}
+
+/// Dispatch a parsed request and envelope its result.
+async fn run_request(
+    request: Request,
+    context: &Arc<ServerContext>,
+    connection_id: u64,
+    peer: &str,
+) -> Value {
+    let command = request.command.as_deref().unwrap_or_default();
 
     log::debug!("{}: request {} ({})", peer, command, request.message_id);
 
     let call = CallContext {
         server: context,
         connection_id,
+        message_id: &request.message_id,
         peer,
     };
-    let result = api::dispatch(&command, &request.args, call).await;
+    let result = api::dispatch(command, &request.args, call).await;
     if let Err(error) = &result {
         log::info!("{}: {} failed: {}", peer, command, error);
     }

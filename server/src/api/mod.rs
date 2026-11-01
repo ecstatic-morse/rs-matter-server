@@ -22,7 +22,7 @@ pub use thread_diagnostics::ThreadDiagnosticsCache;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use async_channel::{Receiver, Sender};
 
@@ -30,10 +30,16 @@ use crate::matter::actor::{FabricInfo, MatterHandle};
 use crate::matter::dcl::DclClient;
 use crate::matter::subscriptions;
 use crate::protocol::error::{ApiError, ApiResult};
-use crate::protocol::events::Event;
+use crate::protocol::events::{Event, Progress};
 use crate::protocol::message::Args;
 use crate::protocol::model::MatterNodeEvent;
 use crate::storage::{ConfigStore, NodeStore};
+
+/// How long a NOC issued to an outside commissioner stays redeemable by
+/// `complete_commissioning`: the longest a device's fail-safe may run
+/// (`MaxCumulativeFailsafeSeconds` is at most 900 s), after which the device
+/// has rolled the NOC back anyway.
+const ISSUED_NOC_LIFETIME: Duration = Duration::from_secs(900);
 
 /// How many Matter events `diagnostics` reports, matching the reference.
 const EVENT_HISTORY_SIZE: usize = 25;
@@ -161,6 +167,10 @@ pub struct ServerContext {
     /// before it sends anything, and the fabric only changes when its label
     /// does. Caching it keeps connection setup off the Matter actor entirely.
     fabric: Mutex<Option<FabricInfo>>,
+    /// Node ids `issue_noc` signed a NOC for that `complete_commissioning`
+    /// has not finished yet, with when they were issued. In memory only: a
+    /// restart outlasts any fail-safe that could still be armed for them.
+    issued_nocs: Mutex<BTreeMap<u64, Instant>>,
 }
 
 impl ServerContext {
@@ -189,7 +199,29 @@ impl ServerContext {
             fabric_label_owner: AtomicU64::new(0),
             event_history: Mutex::new(VecDeque::new()),
             fabric: Mutex::new(None),
+            issued_nocs: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Remember that a NOC was issued for this node id.
+    pub fn note_issued_noc(&self, node_id: u64) {
+        let mut issued = self.issued_nocs.lock().unwrap();
+        issued.retain(|_, at| at.elapsed() < ISSUED_NOC_LIFETIME);
+        issued.insert(node_id, Instant::now());
+    }
+
+    /// Whether a NOC issued for this node id may still be on a device.
+    pub fn has_issued_noc(&self, node_id: u64) -> bool {
+        self.issued_nocs
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .is_some_and(|at| at.elapsed() < ISSUED_NOC_LIFETIME)
+    }
+
+    /// Forget an issued NOC once its node is commissioned.
+    pub fn clear_issued_noc(&self, node_id: u64) {
+        self.issued_nocs.lock().unwrap().remove(&node_id);
     }
 
     /// The controller's fabric, fetched from the actor on first use.
@@ -348,8 +380,28 @@ impl ServerContext {
 pub struct CallContext<'a> {
     pub server: &'a ServerContext,
     pub connection_id: u64,
+    /// The request's id, which progress events carry so a client can tell
+    /// which of its commands they belong to.
+    pub message_id: &'a serde_json::Value,
     /// The client's address, which scopes an OTA upload reservation.
     pub peer: &'a str,
+}
+
+impl CallContext<'_> {
+    /// A progress reporter for this request: live if the request asked for
+    /// one with `"progress": true`, and silent otherwise, so clients that
+    /// never heard of `commissioning_progress` never receive it.
+    pub fn progress(&self, args: &Args) -> Result<Progress, ApiError> {
+        if !args.bool_or("progress", false)? {
+            return Ok(Progress::disabled());
+        }
+        let events = self.server.events.clone();
+        Ok(Progress::new(
+            self.connection_id,
+            self.message_id.clone(),
+            Arc::new(move |event| events.publish(event)),
+        ))
+    }
 }
 
 /// Every command this server implements.
@@ -381,6 +433,8 @@ pub const COMMANDS: &[&str] = &[
     "get_fabric_label",
     "commission_with_code",
     "commission_on_network",
+    "issue_noc",
+    "complete_commissioning",
     "open_commissioning_window",
     "discover",
     "discover_commissionable_nodes",
@@ -436,6 +490,8 @@ pub async fn dispatch(command: &str, args: &Args, context: CallContext<'_>) -> A
         // -- commissioning -------------------------------------------------
         "commission_with_code" => commissioning::commission_with_code(args, context).await,
         "commission_on_network" => commissioning::commission_on_network(args, context).await,
+        "issue_noc" => commissioning::issue_noc(args, context).await,
+        "complete_commissioning" => commissioning::complete_commissioning(args, context).await,
         "open_commissioning_window" => {
             commissioning::open_commissioning_window(args, context).await
         }
@@ -543,6 +599,17 @@ mod tests {
     }
 
     #[test]
+    fn issued_nocs_are_tracked_until_cleared() {
+        let context = crate::api::tests_support::test_context();
+        assert!(!context.has_issued_noc(5));
+        context.note_issued_noc(5);
+        assert!(context.has_issued_noc(5));
+        assert!(!context.has_issued_noc(6));
+        context.clear_issued_noc(5);
+        assert!(!context.has_issued_noc(5));
+    }
+
+    #[test]
     fn a_disconnected_subscriber_is_dropped_on_publish() {
         let bus = EventBus::new();
         let receiver = bus.subscribe();
@@ -596,6 +663,7 @@ pub mod tests_support {
         CallContext {
             server: context,
             connection_id: 1,
+            message_id: &serde_json::Value::Null,
             peer: "127.0.0.1:1234",
         }
     }

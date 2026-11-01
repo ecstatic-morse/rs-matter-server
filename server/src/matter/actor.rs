@@ -28,11 +28,15 @@ use rs_matter::transport::network::Address;
 use rs_matter::Matter;
 
 use crate::protocol::error::{ApiError, ErrorCode};
+use crate::protocol::events::{CommissioningStep, Progress};
 use crate::protocol::model::{AttributesData, CommissionableNodeData};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
-use super::commissioning::{commission_at_address, Completion, NetworkCredentials};
+use super::commissioning::{
+    commission_at_address, complete_commissioning, issue_credentials, Completion,
+    IssuedCredentials, NetworkCredentials,
+};
 use super::controller::persist_fabric;
 use super::interaction;
 use super::ota_provider;
@@ -96,6 +100,17 @@ pub enum MatterOp {
         target: CommissionTarget,
         passcode: u32,
         node_id: u64,
+        progress: Progress,
+    },
+    /// Sign a CSR another commissioner collected from a device (remote CA).
+    IssueNoc {
+        csr: Vec<u8>,
+        node_id: u64,
+    },
+    /// CASE + `CommissioningComplete` for a device that holds a NOC issued
+    /// by [`MatterOp::IssueNoc`].
+    CompleteCommissioning {
+        node_id: u64,
     },
     DiscoverCommissionable {
         filter: CommissionableFilter,
@@ -152,7 +167,7 @@ pub enum MatterOp {
 impl MatterOp {
     fn timeout(&self) -> Duration {
         match self {
-            Self::Commission { .. } => COMMISSIONING_TIMEOUT,
+            Self::Commission { .. } | Self::CompleteCommissioning { .. } => COMMISSIONING_TIMEOUT,
             Self::Interview { .. } => INTERVIEW_TIMEOUT,
             Self::DiscoverCommissionable { timeout_ms, .. } => {
                 // Discovery is bounded by its own browse window; allow a little
@@ -168,6 +183,8 @@ impl MatterOp {
             Self::FabricInfo => "fabric_info",
             Self::SetFabricLabel { .. } => "set_fabric_label",
             Self::Commission { .. } => "commission",
+            Self::IssueNoc { .. } => "issue_noc",
+            Self::CompleteCommissioning { .. } => "complete_commissioning",
             Self::DiscoverCommissionable { .. } => "discover",
             Self::ReadAttributes { .. } => "read",
             Self::GrantOtaAccess { .. } => "grant_ota_access",
@@ -199,6 +216,7 @@ pub enum MatterOutcome {
     },
     Discovered(Vec<CommissionableNodeData>),
     Subscribed(interaction::Subscription),
+    Issued(IssuedCredentials),
 }
 
 /// One queued op and where its answer goes. Opaque to callers: it exists so
@@ -381,12 +399,14 @@ impl MatterHandle {
         target: CommissionTarget,
         passcode: u32,
         node_id: u64,
+        progress: Progress,
     ) -> Result<(u64, String, u8), ApiError> {
         match self
             .call(MatterOp::Commission {
                 target,
                 passcode,
                 node_id,
+                progress,
             })
             .await?
         {
@@ -397,6 +417,23 @@ impl MatterHandle {
             } => Ok((node_id, address, device_fabric_index)),
             other => Err(unexpected(other)),
         }
+    }
+
+    pub async fn issue_noc(
+        &self,
+        csr: Vec<u8>,
+        node_id: u64,
+    ) -> Result<IssuedCredentials, ApiError> {
+        match self.call(MatterOp::IssueNoc { csr, node_id }).await? {
+            MatterOutcome::Issued(credentials) => Ok(credentials),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    pub async fn complete_commissioning(&self, node_id: u64) -> Result<(), ApiError> {
+        self.call(MatterOp::CompleteCommissioning { node_id })
+            .await
+            .map(|_| ())
     }
 
     pub async fn discover(
@@ -684,7 +721,25 @@ async fn execute<C: Crypto + Clone>(
             target,
             passcode,
             node_id,
-        } => commission(context, fabric_index, target, passcode, node_id).await,
+            progress,
+        } => commission(context, fabric_index, target, passcode, node_id, &progress).await,
+
+        MatterOp::IssueNoc { csr, node_id } => issue_credentials(
+            matter,
+            &context.crypto,
+            context.issuer_private_key,
+            &csr,
+            node_id,
+        )
+        .map(MatterOutcome::Issued),
+
+        MatterOp::CompleteCommissioning { node_id } => {
+            complete_commissioning(matter, &context.crypto, context.issuer_private_key, node_id)
+                .await?;
+            persist_fabric(matter, &context.storage_path)
+                .map_err(|e| ApiError::sdk(format!("Failed to persist the fabric: {:?}", e)))?;
+            Ok(MatterOutcome::Empty)
+        }
     }
 }
 
@@ -763,6 +818,7 @@ async fn commission<C: Crypto + Clone>(
     target: CommissionTarget,
     passcode: u32,
     node_id: u64,
+    progress: &Progress,
 ) -> Result<MatterOutcome, ApiError> {
     let address = match target {
         CommissionTarget::Bluetooth {
@@ -777,11 +833,13 @@ async fn commission<C: Crypto + Clone>(
                 credentials,
                 passcode,
                 node_id,
+                progress,
             )
             .await
         }
         CommissionTarget::Address { address } => parse_address(&address)?,
         CommissionTarget::Discovered { filter, timeout_ms } => {
+            progress.node_step(CommissioningStep::Discovering, node_id);
             let (address, _) = context
                 .matter
                 .transport()
@@ -807,6 +865,7 @@ async fn commission<C: Crypto + Clone>(
             // The device answered at this address over IP and still will.
             // It is already on a network; nothing to provision.
             credentials: None,
+            progress,
         },
     )
     .await
@@ -843,6 +902,7 @@ async fn commission_over_ble<C: Crypto + Clone>(
     credentials: Option<NetworkCredentials>,
     passcode: u32,
     node_id: u64,
+    progress: &Progress,
 ) -> Result<MatterOutcome, ApiError> {
     use super::ble::BleAdapter;
     use rs_matter::transport::network::BtAddr;
@@ -856,6 +916,7 @@ async fn commission_over_ble<C: Crypto + Clone>(
     }
 
     let adapter = BleAdapter::open(None).await?;
+    progress.node_step(CommissioningStep::BluetoothScanning, node_id);
     let addr: BtAddr = adapter.scan(&filter, timeout_secs).await?;
     log::info!("Commissioning the device at {} over Bluetooth", addr);
 
@@ -871,6 +932,7 @@ async fn commission_over_ble<C: Crypto + Clone>(
                 node_id,
                 Completion {
                     credentials: credentials.as_ref(),
+                    progress,
                 },
             )
             .await,
@@ -913,6 +975,7 @@ async fn commission_over_ble<C: Crypto + Clone>(
     _credentials: Option<NetworkCredentials>,
     _passcode: u32,
     _node_id: u64,
+    _progress: &Progress,
 ) -> Result<MatterOutcome, ApiError> {
     Err(ApiError::commission_failed(
         "This build has no Bluetooth support. It needs the `bluetooth` cargo \
@@ -970,6 +1033,7 @@ mod tests {
                 },
                 passcode: 1,
                 node_id: 1,
+                progress: Progress::disabled(),
             }
             .timeout(),
             COMMISSIONING_TIMEOUT

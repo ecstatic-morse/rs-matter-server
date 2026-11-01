@@ -347,6 +347,7 @@ mod tests {
         let second = CallContext {
             server: &context,
             connection_id: 2,
+            message_id: &Value::Null,
             peer: "127.0.0.1:2",
         };
         assert!(context.claim_fabric_label(1));

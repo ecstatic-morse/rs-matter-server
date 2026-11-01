@@ -2,6 +2,7 @@
 //! a commissioned device with another controller.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use rs_matter::crypto::{CryptoSensitive, CryptoSensitiveRef};
 use rs_matter::pairing::qr::{no_optional_data, CommFlowType, QrPayload};
@@ -18,12 +19,12 @@ use crate::matter::mdns_browser::{self, ServiceInstance};
 use crate::matter::spake2p_verifier::{DEFAULT_ITERATIONS, MAX_SALT_LEN};
 use crate::matter::tlv_json::TlvNode;
 use crate::protocol::error::{ApiError, ApiResult};
-use crate::protocol::events::Event;
+use crate::protocol::events::{CommissioningStep, Event, Progress};
 use crate::protocol::message::Args;
 use crate::protocol::model::{CommissionableNodeData, CommissioningParameters, MatterNodeData};
 use crate::storage::{thread_dataset, StoredNode};
 
-use super::{fabrics, nodes, now_iso, require_node, CallContext};
+use super::{fabrics, icd, nodes, now_iso, require_node, CallContext};
 
 /// A setup passcode is a little-endian `u32`. rs-matter names the type in a
 /// private module, so it is spelled out here as the public canonical type.
@@ -46,6 +47,7 @@ pub async fn commission_with_code(args: &Args, context: CallContext<'_>) -> ApiR
     let code = args.req_str("code")?;
     let network_only = args.bool_or("network_only", false)?;
     let pairing = parse_pairing_code(code)?;
+    let progress = context.progress(args)?;
 
     // A device already on the network is found over mDNS, which is quicker
     // and needs no radio, so that is always tried first. Bluetooth is the
@@ -67,6 +69,7 @@ pub async fn commission_with_code(args: &Args, context: CallContext<'_>) -> ApiR
             timeout_ms: DISCOVERY_TIMEOUT_MS,
         },
         pairing.passcode,
+        &progress,
     )
     .await;
 
@@ -82,6 +85,7 @@ pub async fn commission_with_code(args: &Args, context: CallContext<'_>) -> ApiR
                     credentials: Some(credentials),
                 },
                 pairing.passcode,
+                &progress,
             )
             .await
         }
@@ -120,6 +124,7 @@ fn network_credentials(context: &CallContext<'_>) -> NetworkCredentials {
 /// Commission a device already on the IP network.
 pub async fn commission_on_network(args: &Args, context: CallContext<'_>) -> ApiResult {
     let passcode = args.req_u32("setup_pin_code")?;
+    let progress = context.progress(args)?;
     let target = match args.str("ip_addr")? {
         Some(address) if !address.is_empty() => CommissionTarget::Address {
             address: address.to_string(),
@@ -129,7 +134,7 @@ pub async fn commission_on_network(args: &Args, context: CallContext<'_>) -> Api
             timeout_ms: DISCOVERY_TIMEOUT_MS,
         },
     };
-    commission(context, target, passcode).await
+    commission(context, target, passcode, &progress).await
 }
 
 /// The shared tail of both commissioning commands: allocate an id, run the
@@ -142,6 +147,7 @@ async fn commission(
     context: CallContext<'_>,
     target: CommissionTarget,
     passcode: u32,
+    progress: &Progress,
 ) -> ApiResult {
     let node_id = context
         .server
@@ -152,9 +158,34 @@ async fn commission(
     let (node_id, address, device_fabric_index) = context
         .server
         .matter
-        .commission(target, passcode, node_id)
+        .commission(target, passcode, node_id, progress.clone())
         .await?;
 
+    finish_commissioned(
+        context,
+        node_id,
+        address,
+        Some(device_fabric_index),
+        false,
+        progress,
+    )
+    .await
+}
+
+/// Everything after `CommissioningComplete`: store the node, find it, label
+/// the fabric, optionally register for check-ins, interview, announce.
+///
+/// The node is stored before the interview so a process exit mid-interview
+/// leaves a node that can be re-interviewed rather than a device that is on
+/// the fabric but invisible to the controller.
+async fn finish_commissioned(
+    context: CallContext<'_>,
+    node_id: u64,
+    address: String,
+    device_fabric_index: Option<u8>,
+    register_for_check_ins: bool,
+    progress: &Progress,
+) -> ApiResult {
     let node = MatterNodeData::new(node_id, now_iso());
     let mut stored = StoredNode::new(node);
     // Bluetooth commissioning reports no address of its own: a BT MAC is not
@@ -167,7 +198,7 @@ async fn commission(
     } else {
         vec![address]
     };
-    stored.device_fabric_index = Some(device_fabric_index);
+    stored.device_fabric_index = device_fabric_index;
     context.server.nodes.upsert(stored);
     context
         .server
@@ -184,9 +215,26 @@ async fn commission(
         nodes::resolve_addresses(context.server, node_id).await;
     }
 
+    // Straight after commissioning is when a long-idle device is sure to be
+    // awake, so check-in registration goes first. Best effort, like the
+    // label: the device is commissioned whether or not it succeeds.
+    if register_for_check_ins {
+        progress.node_step(CommissioningStep::IcdRegistration, node_id);
+        match icd::register_if_lit(node_id, context).await {
+            Ok(true) => log::info!("Registered for check-ins from node {}", node_id),
+            Ok(false) => {}
+            Err(error) => log::warn!(
+                "Node {} was commissioned but check-in registration failed: {}",
+                node_id,
+                error
+            ),
+        }
+    }
+
     // Tell the device what to call this fabric, so a user listing fabrics on
     // it from another ecosystem sees a name rather than a blank. Best effort:
     // a device that refuses the label is still commissioned.
+    progress.node_step(CommissioningStep::FabricLabel, node_id);
     let label = context.server.config.fabric_label();
     if let Err(error) = fabrics::push_fabric_label(context, node_id, &label).await {
         log::warn!(
@@ -199,6 +247,7 @@ async fn commission(
 
     // The first interview populates the attributes clients need to build
     // entities, so `node_added` is published after it rather than before.
+    progress.node_step(CommissioningStep::Interview, node_id);
     let node = match context.server.matter.interview(node_id).await {
         Ok(attributes) => nodes::apply_interview(context.server, node_id, attributes)?,
         Err(error) => {
@@ -217,6 +266,159 @@ async fn commission(
 
     context.server.events.publish(Event::node_added(&node));
     Ok(serde_json::to_value(node).unwrap_or(Value::Null))
+}
+
+/// How long `complete_commissioning` waits for the device to appear on its
+/// operational network before handing over to rs-matter's own resolve. A
+/// Thread device has to attach and register with the border router's SRP
+/// server first, which routinely takes tens of seconds.
+const OPERATIONAL_DISCOVERY_WAIT: Duration = Duration::from_secs(45);
+/// One browse within that wait.
+const OPERATIONAL_BROWSE: Duration = Duration::from_millis(1500);
+
+/// The operational-credentials attribute naming the fabric slot the device
+/// gave the accessing fabric.
+const CURRENT_FABRIC_INDEX_PATH: &str = "0/62/5";
+
+/// Remote CA, step one: sign the CSR an outside commissioner collected from a
+/// device over PASE, for a freshly allocated node id.
+///
+/// The commissioner installs the returned chain with
+/// `AddTrustedRootCertificate` and `AddNOC` (using `ipk`, `admin_subject` and
+/// `admin_vendor_id` as given), provisions the device's network, and calls
+/// `complete_commissioning` with the returned `node_id` before its fail-safe
+/// expires.
+pub async fn issue_noc(args: &Args, context: CallContext<'_>) -> ApiResult {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+
+    let csr = BASE64
+        .decode(args.req_str("csr")?)
+        .map_err(|_| ApiError::invalid_args("`csr` must be a base64 DER PKCS#10 request"))?;
+
+    let node_id = context
+        .server
+        .config
+        .allocate_node_id()
+        .map_err(|e| ApiError::sdk(format!("Failed to allocate a node id: {}", e)))?;
+
+    let issued = context.server.matter.issue_noc(csr, node_id).await?;
+    context.server.note_issued_noc(node_id);
+    let optional = |bytes: &[u8]| (!bytes.is_empty()).then(|| BASE64.encode(bytes));
+
+    Ok(serde_json::json!({
+        "node_id": issued.node_id,
+        "noc": BASE64.encode(&issued.noc),
+        "icac": optional(&issued.icac),
+        "rcac": BASE64.encode(&issued.rcac),
+        "noc_der": BASE64.encode(&issued.noc_der),
+        "icac_der": optional(&issued.icac_der),
+        "rcac_der": BASE64.encode(&issued.rcac_der),
+        "ipk": BASE64.encode(&issued.ipk),
+        "admin_subject": issued.admin_subject,
+        "admin_vendor_id": issued.admin_vendor_id,
+    }))
+}
+
+/// Remote CA, step two: finish commissioning a device that holds a NOC from
+/// `issue_noc` and has been told to join its network.
+///
+/// Waits for the device to announce itself, sends `CommissioningComplete`
+/// over CASE, then does what `commission_with_code` does afterwards, plus
+/// check-in registration for a device that supports LIT (unless
+/// `register_icd` is false). Answers with the node, like the other
+/// commissioning commands.
+pub async fn complete_commissioning(args: &Args, context: CallContext<'_>) -> ApiResult {
+    let node_id = args.req_u64("node_id")?;
+    let device_fabric_index = args.u8("device_fabric_index")?;
+    let register_for_check_ins = args.bool_or("register_icd", true)?;
+    let progress = context.progress(args)?;
+
+    if context.server.nodes.contains(node_id) {
+        return Err(ApiError::invalid_args(format!(
+            "Node {} is already commissioned",
+            node_id
+        )));
+    }
+    // Refused up front rather than after a long wait for a device that was
+    // never going to appear under this id.
+    if !context.server.has_issued_noc(node_id) {
+        return Err(ApiError::invalid_args(format!(
+            "No NOC was issued for node {} by `issue_noc`, or it has expired",
+            node_id
+        )));
+    }
+
+    progress.node_step(CommissioningStep::OperationalDiscovery, node_id);
+    let address = wait_for_operational(context, node_id).await;
+    if address.is_none() {
+        // Not fatal: rs-matter resolves again, with retries, before CASE.
+        // This wait exists to report progress, not to decide the outcome.
+        log::info!(
+            "Node {} has not announced itself yet; trying to complete anyway",
+            node_id
+        );
+    }
+
+    progress.node_step(CommissioningStep::Completing, node_id);
+    context
+        .server
+        .matter
+        .complete_commissioning(node_id)
+        .await?;
+    context.server.clear_issued_noc(node_id);
+
+    // The outside commissioner saw the fabric index in `NOCResponse`; when it
+    // did not pass it on, ask the device, which reports it to the accessing
+    // fabric.
+    let device_fabric_index = match device_fabric_index {
+        Some(index) => Some(index),
+        None => read_current_fabric_index(context, node_id).await,
+    };
+
+    finish_commissioned(
+        context,
+        node_id,
+        address.unwrap_or_default(),
+        device_fabric_index,
+        register_for_check_ins,
+        &progress,
+    )
+    .await
+}
+
+async fn wait_for_operational(context: CallContext<'_>, node_id: u64) -> Option<String> {
+    let fabric = context.server.fabric_info().await.ok()?;
+    let deadline = Instant::now() + OPERATIONAL_DISCOVERY_WAIT;
+    while Instant::now() < deadline {
+        let addresses = mdns_browser::resolve_operational(
+            fabric.compressed_fabric_id,
+            node_id,
+            OPERATIONAL_BROWSE,
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(address) = addresses.first() {
+            return Some(address.to_string());
+        }
+    }
+    None
+}
+
+async fn read_current_fabric_index(context: CallContext<'_>, node_id: u64) -> Option<u8> {
+    let path = crate::protocol::paths::parse_path(CURRENT_FABRIC_INDEX_PATH)
+        .ok()?
+        .to_attr_path();
+    let attributes = context
+        .server
+        .matter
+        .read_attributes(node_id, vec![path], true)
+        .await
+        .ok()?;
+    attributes
+        .get(CURRENT_FABRIC_INDEX_PATH)
+        .and_then(Value::as_u64)
+        .and_then(|index| u8::try_from(index).ok())
 }
 
 /// Open a commissioning window so another controller can join the device.

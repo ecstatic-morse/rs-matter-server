@@ -455,3 +455,41 @@ async fn a_malformed_upload_path_is_a_404() {
         response
     );
 }
+
+#[tokio::test]
+async fn issue_noc_wants_a_base64_csr() {
+    let server = test_start().await;
+    let (mut socket, _) = connect(server.port()).await;
+
+    let response = request(&mut socket, "1", "issue_noc", json!({})).await;
+    assert_eq!(response["error_code"], json!(8));
+
+    let response = request(
+        &mut socket,
+        "2",
+        "issue_noc",
+        json!({ "csr": "not base64!" }),
+    )
+    .await;
+    assert_eq!(response["error_code"], json!(8));
+    assert!(response["details"].as_str().unwrap().contains("base64"));
+}
+
+#[tokio::test]
+async fn complete_commissioning_refuses_a_node_id_it_never_issued() {
+    let server = test_start().await;
+    let (mut socket, _) = connect(server.port()).await;
+
+    // Refused at once, not after waiting for a device that will not appear.
+    let started = std::time::Instant::now();
+    let response = request(
+        &mut socket,
+        "1",
+        "complete_commissioning",
+        json!({ "node_id": 42, "progress": true }),
+    )
+    .await;
+    assert_eq!(response["error_code"], json!(8));
+    assert!(response["details"].as_str().unwrap().contains("issue_noc"));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}

@@ -17,7 +17,7 @@ use rs_matter::dm::clusters::decl::network_commissioning::{
 };
 use rs_matter::dm::endpoints::ROOT_ENDPOINT_ID;
 use rs_matter::onboard::noc::NocGenerator;
-use rs_matter::onboard::{CommissionOptions, Commissioner};
+use rs_matter::onboard::{CommissionOptions, CommissionResult, Commissioner};
 use rs_matter::pairing::qr::QrPayload;
 use rs_matter::tlv::OctetStr;
 use rs_matter::transport::exchange::Exchange;
@@ -26,6 +26,7 @@ use rs_matter::transport::network::Address;
 use rs_matter::Matter;
 
 use crate::protocol::error::ApiError;
+use crate::protocol::events::{CommissioningStep, Progress};
 
 /// What a pairing code resolves to.
 #[derive(Clone, Debug)]
@@ -77,6 +78,8 @@ impl NetworkCredentials {
 pub struct Completion<'a> {
     /// The network to hand the device, for one that does not have one yet.
     pub credentials: Option<&'a NetworkCredentials>,
+    /// Where to report each step as it starts.
+    pub progress: &'a Progress,
 }
 
 /// What a completed commissioning produced.
@@ -135,6 +138,7 @@ pub async fn commission_at_address<C: Crypto>(
     node_id: u64,
     completion: Completion<'_>,
 ) -> Result<CommissionOutcome, ApiError> {
+    let progress = completion.progress;
     let fab_idx: NonZeroU8 = matter
         .with_state(|state| state.fabrics.iter().next().map(|f| f.fab_idx()))
         .ok_or_else(|| ApiError::sdk("No fabric is installed on the controller"))?;
@@ -176,6 +180,7 @@ pub async fn commission_at_address<C: Crypto>(
         ..CommissionOptions::default()
     };
 
+    progress.node_step(CommissioningStep::InstallingCredentials, node_id);
     let phase1 = commissioner
         .commission(peer_addr, passcode, &options, node_id, VALID_FOREVER)
         .await
@@ -187,9 +192,11 @@ pub async fn commission_at_address<C: Crypto>(
     // AddNOC and CASE because the Matter spec puts it there: the fail-safe is
     // still armed and the PASE session is still the only way to talk.
     if let Some(credentials) = completion.credentials {
+        progress.node_step(CommissioningStep::ProvisioningNetwork, node_id);
         provision_network(matter, crypto, peer_addr, passcode, credentials).await?;
     }
 
+    progress.node_step(CommissioningStep::Completing, node_id);
     commissioner.complete_via_case(&phase1).await.map_err(|e| {
         ApiError::commission_failed(format!(
             "Commissioning could not be completed over CASE: {:?}",
@@ -201,6 +208,176 @@ pub async fn commission_at_address<C: Crypto>(
         node_id: phase1.device_node_id,
         device_fabric_index: phase1.fabric_index.get(),
     })
+}
+
+/// What a fabric gives an outside commissioner to install on a device.
+///
+/// Remote-CA commissioning: another commissioner (a phone, typically) runs
+/// PASE and sends the device's CSR here; the NOC chain, IPK and admin subject
+/// below are what it then hands the device in `AddTrustedRootCertificate` and
+/// `AddNOC`. The device ends up on this fabric without the other commissioner
+/// ever holding an identity on it.
+#[derive(Clone, Debug)]
+pub struct IssuedCredentials {
+    pub node_id: u64,
+    pub noc: Vec<u8>,
+    /// Empty for a fabric that signs directly off its root.
+    pub icac: Vec<u8>,
+    pub rcac: Vec<u8>,
+    /// The same three certificates as X.509 DER. The CHIP SDK's commissioners
+    /// (Android's `NOCChainIssuer`, Darwin's `MTROperationalCertificateIssuer`)
+    /// take DER and convert to Matter TLV themselves.
+    pub noc_der: Vec<u8>,
+    pub icac_der: Vec<u8>,
+    pub rcac_der: Vec<u8>,
+    /// The IPK epoch key, as `AddNOC` carries it.
+    pub ipk: Vec<u8>,
+    /// `CaseAdminSubject`: this controller's node id, so the ACL entry the
+    /// device creates on `AddNOC` names us as its administrator.
+    pub admin_subject: u64,
+    pub admin_vendor_id: u16,
+}
+
+/// Sign a device's CSR with this fabric's issuer, for a node id the caller
+/// has already allocated.
+///
+/// Attestation is not checked here, and cannot be: it was verified (or not)
+/// by whoever ran PASE. rs-matter has no attestation verification of its own
+/// yet, so this is no weaker than `commission_with_code`.
+pub fn issue_credentials<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    issuer_private_key: &CanonPkcSecretKey,
+    csr_der: &[u8],
+    node_id: u64,
+) -> Result<IssuedCredentials, ApiError> {
+    let fab_idx = controller_fabric(matter)?;
+
+    let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
+    let mut noc_generator = matter
+        .with_state(|state| {
+            let fabric = state.fabrics.fabric(fab_idx)?;
+            NocGenerator::create(
+                issuer_private_key.reference(),
+                fabric.root_ca(),
+                fabric.icac(),
+                &mut noc_buf,
+            )
+        })
+        .map_err(|e| ApiError::sdk(format!("Failed to prepare NOC issuance: {:?}", e.code())))?;
+
+    // `generate` also checks the CSR's self-signature, so a CSR that does not
+    // prove possession of its key is refused before anything is signed.
+    let noc = noc_generator
+        .generate(crypto, csr_der, node_id, &[], VALID_FOREVER)
+        .map_err(|e| ApiError::invalid_args(format!("Could not sign the CSR: {:?}", e.code())))?
+        .to_vec();
+
+    let mut issued = matter
+        .with_state(|state| {
+            let fabric = state.fabrics.fabric(fab_idx)?;
+            Ok::<_, rs_matter::error::Error>(IssuedCredentials {
+                node_id,
+                noc: noc.clone(),
+                icac: fabric.icac().to_vec(),
+                rcac: fabric.root_ca().to_vec(),
+                noc_der: Vec::new(),
+                icac_der: Vec::new(),
+                rcac_der: Vec::new(),
+                ipk: fabric.ipk().epoch_key().access().to_vec(),
+                admin_subject: fabric.node_id(),
+                admin_vendor_id: fabric.vendor_id(),
+            })
+        })
+        .map_err(|e| ApiError::sdk(format!("Failed to read the fabric: {:?}", e.code())))?;
+
+    issued.noc_der = tlv_cert_to_der(&issued.noc)?;
+    issued.rcac_der = tlv_cert_to_der(&issued.rcac)?;
+    if !issued.icac.is_empty() {
+        issued.icac_der = tlv_cert_to_der(&issued.icac)?;
+    }
+    Ok(issued)
+}
+
+/// Re-encode a Matter TLV certificate as the X.509 DER it was derived from.
+pub fn tlv_cert_to_der(tlv: &[u8]) -> Result<Vec<u8>, ApiError> {
+    use rs_matter::cert::{CertRef, MAX_CERT_ASN1_LEN};
+    use rs_matter::tlv::TLVElement;
+
+    let mut der = vec![0u8; MAX_CERT_ASN1_LEN];
+    let len = CertRef::new(TLVElement::new(tlv))
+        .as_asn1(&mut der)
+        .map_err(|e| {
+            ApiError::sdk(format!(
+                "Could not encode a certificate as DER: {:?}",
+                e.code()
+            ))
+        })?;
+    der.truncate(len);
+    Ok(der)
+}
+
+/// Finish commissioning a device another commissioner installed our NOC on:
+/// CASE to it as this fabric's administrator, then `CommissioningComplete`.
+///
+/// The device accepts that from any node on the fabric its fail-safe is
+/// armed for, not only from whoever armed it. The fail-safe is the other
+/// commissioner's; it has to have armed it for long enough to cover this.
+pub async fn complete_commissioning<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    issuer_private_key: &CanonPkcSecretKey,
+    node_id: u64,
+) -> Result<(), ApiError> {
+    let fab_idx = controller_fabric(matter)?;
+
+    // `Commissioner` insists on a NOC generator although phase 2 never signs
+    // anything; this one is built and dropped unused.
+    let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
+    let mut noc_generator = matter
+        .with_state(|state| {
+            let fabric = state.fabrics.fabric(fab_idx)?;
+            NocGenerator::create(
+                issuer_private_key.reference(),
+                fabric.root_ca(),
+                fabric.icac(),
+                &mut noc_buf,
+            )
+        })
+        .map_err(|e| {
+            ApiError::sdk(format!(
+                "Failed to prepare the commissioner: {:?}",
+                e.code()
+            ))
+        })?;
+    let mut commissioner_buf = [0u8; MAX_CERT_TLV_LEN];
+    let mut commissioner = Commissioner::new(
+        matter,
+        crypto,
+        fab_idx,
+        &mut noc_generator,
+        &mut commissioner_buf,
+    );
+
+    // Phase 2 reads only the node id. The device-side fabric index is not
+    // known here (the other commissioner got it in `NOCResponse`), and
+    // nothing on this path uses it.
+    let phase1 = CommissionResult {
+        fabric_index: NonZeroU8::MIN,
+        device_node_id: node_id,
+    };
+    commissioner.complete_via_case(&phase1).await.map_err(|e| {
+        ApiError::commission_failed(format!(
+            "Commissioning could not be completed over CASE: {:?}",
+            e.code()
+        ))
+    })
+}
+
+fn controller_fabric(matter: &Matter<'_>) -> Result<NonZeroU8, ApiError> {
+    matter
+        .with_state(|state| state.fabrics.iter().next().map(|f| f.fab_idx()))
+        .ok_or_else(|| ApiError::sdk("No fabric is installed on the controller"))
 }
 
 /// Hand a device its network credentials over the existing PASE session.

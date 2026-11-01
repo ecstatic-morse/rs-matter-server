@@ -17,9 +17,9 @@ mean duplicating matter.js internals.
 ## Commands
 
 All 43 commands the reference dispatches are routed; none falls through to
-"unknown command", and none is advertised that the reference does not have.
-The `every_advertised_command_is_routed` contract test enforces that against
-`api::COMMANDS`.
+"unknown command". The `every_advertised_command_is_routed` contract test
+enforces that against `api::COMMANDS`, which also holds the two
+[extensions](#extensions) — the only commands here the reference does not have.
 
 | Command | Status | Notes |
 |---|---|---|
@@ -84,6 +84,60 @@ Event gating matches the reference: nothing is delivered before
 `start_listening`, and the Thread, topology and WebRTC events additionally
 require the connection to have issued the corresponding command — which latches
 even when that command returns an error.
+
+## Extensions
+
+Additions the reference does not have. A client that never uses them sees
+exactly the reference's behaviour: no extra commands answer differently, and no
+extra events reach it.
+
+### Remote-CA commissioning
+
+For a commissioner that runs PASE itself — a phone app over Bluetooth, say —
+but should put the device on *this* fabric, with no identity of its own on it.
+
+1. The commissioner arms the fail-safe (long enough to cover step 3, up to the
+   device's `MaxCumulativeFailsafeSeconds`), verifies attestation, and sends
+   `CSRRequest`.
+2. **`issue_noc`** `{ csr }` — `csr` is the base64 DER PKCS#10 request from
+   `NOCSRElements`. Allocates a node id and signs a NOC for it. Answers
+   `{ node_id, noc, icac, rcac, noc_der, icac_der, rcac_der, ipk,
+   admin_subject, admin_vendor_id }`, certificates base64 in both Matter TLV
+   and X.509 DER (the CHIP SDK's issuer callbacks take DER); `icac` is `null`
+   for a fabric without one. The commissioner sends
+   `AddTrustedRootCertificate` and `AddNOC` with these, then provisions the
+   device's network.
+3. **`complete_commissioning`** `{ node_id, device_fabric_index?, register_icd? }`
+   — waits for the device to announce itself on `_matter._tcp`, sends
+   `CommissioningComplete` over CASE, and then does what `commission_with_code`
+   does afterwards: store, resolve, label, interview, `node_added`. A device
+   that supports LIT is also registered for check-ins (as `register_icd`
+   without `allow_multi_admin` would) unless `register_icd` is `false`.
+   `device_fabric_index` is read from the device when omitted. Answers with
+   the node.
+
+`complete_commissioning` only accepts a node id `issue_noc` issued in the last
+15 minutes. Attestation is the commissioner's to check: rs-matter has no
+verification of its own yet, the same gap `commission_with_code` has.
+
+### Commissioning progress
+
+`commission_with_code`, `commission_on_network` and `complete_commissioning`
+accept `"progress": true`. The connection that sent the command then receives
+
+```json
+{"event": "commissioning_progress",
+ "data": {"message_id": "<the command's>", "step": "operational_discovery", "node_id": 7}}
+```
+
+as each step starts — `discovering`, `bluetooth_scanning`,
+`installing_credentials`, `provisioning_network`, `operational_discovery`,
+`completing`, `icd_registration`, `fabric_label`, `interview` — and the
+command's response ends the flow. Progress goes to the requesting connection
+only, whether or not it issued `start_listening`, and arrives while the command
+runs. Other events published during a command still arrive after its response,
+as they always have. `installing_credentials` and `completing` are each one
+call into rs-matter, so the steps inside them are not reported.
 
 ## Migration
 

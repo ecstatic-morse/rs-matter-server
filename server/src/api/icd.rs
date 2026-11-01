@@ -142,6 +142,42 @@ pub async fn register_icd(args: &Args, context: CallContext<'_>) -> ApiResult {
         }
     }
 
+    register(node_id, context).await?;
+
+    let state = read_icd_state(node_id, context).await?;
+    Ok(serde_json::to_value(state).unwrap_or(Value::Null))
+}
+
+/// Register this controller as a freshly commissioned node's check-in client,
+/// when that is both useful and safe.
+///
+/// Useful: only a device that supports LIT needs it, and one already
+/// registered does not. Safe: the same rule as `register_icd` without
+/// `allow_multi_admin` — a device that has administrators from other vendors
+/// is left alone, and that is reported as `false` rather than as an error,
+/// because commissioning itself succeeded either way.
+pub async fn register_if_lit(node_id: u64, context: CallContext<'_>) -> Result<bool, ApiError> {
+    let state = read_icd_state(node_id, context).await?;
+    if !state.lit_supported || state.registered {
+        return Ok(false);
+    }
+
+    let others = other_vendor_admins(node_id, &[], context).await?;
+    if !others.is_empty() {
+        log::warn!(
+            "Node {} has administrators from other vendors ({:?}); not registering for check-ins",
+            node_id,
+            others
+        );
+        return Ok(false);
+    }
+
+    register(node_id, context).await?;
+    Ok(true)
+}
+
+/// `RegisterClient` with a fresh key, which is stored once the device accepts it.
+async fn register(node_id: u64, context: CallContext<'_>) -> Result<(), ApiError> {
     let fabric = context.server.fabric_info().await?;
     let mut key = vec![0u8; ICD_KEY_LEN];
     getrandom_key(&mut key);
@@ -174,9 +210,7 @@ pub async fn register_icd(args: &Args, context: CallContext<'_>) -> ApiResult {
             error
         );
     }
-
-    let state = read_icd_state(node_id, context).await?;
-    Ok(serde_json::to_value(state).unwrap_or(Value::Null))
+    Ok(())
 }
 
 /// Drop this controller's registration.

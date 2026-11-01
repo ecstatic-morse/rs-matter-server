@@ -11,6 +11,6 @@ pub mod model;
 pub mod paths;
 
 pub use error::{ApiError, ApiResult, ErrorCode};
-pub use events::{Event, EventClass, EventSubscriptions};
+pub use events::{CommissioningStep, Event, EventClass, EventSubscriptions, Progress};
 pub use message::{response_envelope, Args, Request};
 pub use model::{MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION, TEST_NODE_START};
