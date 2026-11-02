@@ -113,12 +113,27 @@ Every option is a flag or an environment variable.
 | `--disable-thread-diagnostics` | `DISABLE_THREAD_DIAGNOSTICS` | off | Turn off Thread discovery |
 | `--disable-bluetooth` | `DISABLE_BLUETOOTH` | off | Turn off Bluetooth commissioning where an adapter exists |
 | `--enable-test-net-dcl` | `ENABLE_TEST_NET_DCL` | off | Also query the CSA test ledger |
+| `--ws-auth-token-file` | `WS_AUTH_TOKEN_FILE` | — | File holding the bearer token WebSocket clients must present; wins over `WS_AUTH_TOKEN` |
+| `--ws-auth-token` | `WS_AUTH_TOKEN` | — | The bearer token WebSocket clients must present |
 | `--health-check` | — | — | Probe a running server and exit; used by the container health check |
 | `--version` | — | — | Print the version and exit |
 
+### Authentication
+
+The protocol has no authentication of its own: whoever reaches the WebSocket
+can commission, control and remove every device. With neither token option set
+the server behaves as the reference does, and warns at startup — bind it to
+localhost then. With a token set, every WebSocket upgrade must carry
+`Authorization: Bearer <token>` (compared in constant time) or it is answered
+`401 Unauthorized` and not upgraded. The file is read once at startup and
+surrounding whitespace is ignored; an empty or unreadable token stops the
+server rather than leaving it open. `GET /health`, and so `--health-check`,
+needs no token.
+
 ## Endpoints
 
-- `ws://host:5580/ws` — the protocol. On connect the server sends a
+- `ws://host:5580/ws` — the protocol (behind the bearer token, if one is
+  configured — see [Authentication](#authentication)). On connect the server sends a
   `server_info` frame unprompted; after `start_listening` it streams events.
 - `POST /ota-upload/<id>` — upload a local `.ota` firmware image, after
   reserving an id with `initiate_ota_upload`.

@@ -129,6 +129,17 @@ pub fn method_not_allowed(allow: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A 401 for a WebSocket upgrade without the configured bearer token.
+pub fn unauthorized() -> Vec<u8> {
+    let body = r#"{"error":"unauthorized"}"#;
+    format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
 /// A stream that yields buffered bytes before reading from the inner stream.
 pub struct Prefixed<S> {
     prefix: Vec<u8>,

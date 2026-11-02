@@ -38,6 +38,17 @@ where
     };
 
     if head.is_websocket_upgrade() {
+        if let Some(token) = &context.ws_auth {
+            if !token.authorizes(&head) {
+                log::warn!(
+                    "{}: refused a WebSocket upgrade without the configured bearer token",
+                    peer
+                );
+                let _ = stream.write_all(&http::unauthorized()).await;
+                let _ = stream.flush().await;
+                return;
+            }
+        }
         serve_websocket(Prefixed::new(raw, stream), peer, context).await;
         return;
     }

@@ -493,3 +493,47 @@ async fn complete_commissioning_refuses_a_node_id_it_never_issued() {
     assert!(response["details"].as_str().unwrap().contains("issue_noc"));
     assert!(started.elapsed() < Duration::from_secs(1));
 }
+
+#[tokio::test]
+async fn a_configured_token_guards_the_websocket_upgrade() {
+    use rs_matter_server::ws::auth::AuthToken;
+    use ws_lib::client::IntoClientRequest;
+
+    let server = test_start_with(|mut context| {
+        context.ws_auth = Some(AuthToken::new("s3cret").unwrap());
+        context
+    })
+    .await;
+    let url = format!("ws://127.0.0.1:{}/ws", server.port());
+
+    let with = |authorization: Option<&str>| {
+        let mut request = url.as_str().into_client_request().unwrap();
+        if let Some(value) = authorization {
+            request
+                .headers_mut()
+                .insert("Authorization", value.parse().unwrap());
+        }
+        request
+    };
+
+    for authorization in [None, Some("Bearer wrong"), Some("Basic s3cret")] {
+        match connect_async(with(authorization)).await {
+            Err(ws_lib::Error::Http(response)) => assert_eq!(response.status(), 401),
+            other => panic!("{:?} was not refused with 401: {:?}", authorization, other),
+        }
+    }
+
+    let (mut socket, _) = connect_async(with(Some("Bearer s3cret")))
+        .await
+        .expect("the right token is accepted");
+    let greeting = next_json(&mut socket).await;
+    assert!(greeting["schema_version"].is_number());
+
+    // The health check has nothing to authenticate with, so it stays open.
+    let response = http_request(
+        server.port(),
+        "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{}", response);
+}

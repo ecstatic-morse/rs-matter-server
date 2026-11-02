@@ -139,6 +139,16 @@ runs. Other events published during a command still arrive after its response,
 as they always have. `installing_credentials` and `completing` are each one
 call into rs-matter, so the steps inside them are not reported.
 
+### WebSocket authentication
+
+The reference accepts any WebSocket client. With `WS_AUTH_TOKEN_FILE` or
+`WS_AUTH_TOKEN` set, this server requires `Authorization: Bearer <token>` on the
+upgrade request and answers anything else with `401 Unauthorized` (with
+`WWW-Authenticate: Bearer`) before the handshake, so an unauthenticated client
+never sees `server_info`. Nothing changes once connected. Unset, the endpoint is
+open, as the reference's is, and the server logs a warning at startup.
+`/health` is never guarded.
+
 ## Migration
 
 `--import-matterjs` adopts a matterjs-server installation's fabric so that its

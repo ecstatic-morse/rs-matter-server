@@ -171,6 +171,9 @@ pub struct ServerContext {
     /// has not finished yet, with when they were issued. In memory only: a
     /// restart outlasts any fail-safe that could still be armed for them.
     issued_nocs: Mutex<BTreeMap<u64, Instant>>,
+    /// The bearer token every WebSocket upgrade must carry, or `None` for an
+    /// unauthenticated endpoint (the reference's behaviour). A fork extension.
+    pub ws_auth: Option<crate::ws::auth::AuthToken>,
 }
 
 impl ServerContext {
@@ -200,6 +203,7 @@ impl ServerContext {
             event_history: Mutex::new(VecDeque::new()),
             fabric: Mutex::new(None),
             issued_nocs: Mutex::new(BTreeMap::new()),
+            ws_auth: None,
         }
     }
 

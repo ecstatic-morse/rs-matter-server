@@ -5,6 +5,7 @@
 //! Connections run on their own threads and reach it only through the actor's
 //! channel.
 
+pub mod auth;
 pub mod connection;
 pub mod http;
 
@@ -43,6 +44,9 @@ pub struct ServerConfig {
     pub runtime: RuntimeInfo,
     pub console_loglevel: String,
     pub monitor: MonitorConfig,
+    /// The bearer token WebSocket clients must present; `None` leaves the
+    /// endpoint open.
+    pub ws_auth: Option<auth::AuthToken>,
 }
 
 /// Start the server and run until the Matter transport stops.
@@ -90,13 +94,15 @@ pub async fn run(
 
     let (handle, requests) = actor::channel();
     let monitor_config = config.monitor;
-    let context = Arc::new(ServerContext::new(
+    let mut context = ServerContext::new(
         handle,
         nodes,
         store,
         config.runtime,
         config.console_loglevel,
-    ));
+    );
+    context.ws_auth = config.ws_auth;
+    let context = Arc::new(context);
 
     // Attribute monitoring runs off the Matter thread: it holds only the actor
     // handle, so it queues work exactly as a connection does.

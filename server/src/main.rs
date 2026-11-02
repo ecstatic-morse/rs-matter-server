@@ -89,6 +89,17 @@ struct Args {
     #[arg(long, env = "ENABLE_TEST_NET_DCL", default_value_t = false)]
     enable_test_net_dcl: bool,
 
+    /// A file holding the bearer token WebSocket clients must present, as
+    /// `Authorization: Bearer <token>`. Surrounding whitespace is ignored.
+    /// Takes precedence over `--ws-auth-token`.
+    #[arg(long, env = "WS_AUTH_TOKEN_FILE")]
+    ws_auth_token_file: Option<PathBuf>,
+
+    /// The bearer token WebSocket clients must present. Without this or
+    /// `--ws-auth-token-file` the WebSocket API is unauthenticated.
+    #[arg(long, env = "WS_AUTH_TOKEN", hide_env_values = true)]
+    ws_auth_token: Option<String>,
+
     /// Probe a running server's `/health` endpoint and exit. Used as the
     /// container health check, so it deliberately starts nothing.
     #[arg(long, default_value_t = false)]
@@ -260,6 +271,23 @@ fn main() -> anyhow::Result<()> {
 
 /// Everything from the fabric onwards, on the server thread.
 fn serve(args: Args) -> anyhow::Result<()> {
+    // Before anything else, so a token that cannot be read stops the server
+    // instead of leaving it running open.
+    let ws_auth = ws::auth::load(
+        args.ws_auth_token_file.as_deref(),
+        args.ws_auth_token.as_deref(),
+    )?;
+    if ws_auth.is_some() {
+        log::info!("WebSocket clients must present the configured bearer token");
+    } else {
+        log::warn!(
+            "The WebSocket API is unauthenticated: anyone who can reach {} controls every \
+             device on the fabric. Bind it only to localhost or a Unix socket, or set \
+             WS_AUTH_TOKEN_FILE or WS_AUTH_TOKEN.",
+            args.listen
+        );
+    }
+
     // Read the source before touching our own storage: a source that cannot be
     // imported must not leave a freshly created fabric of our own behind,
     // because that is the state a retry would then refuse to import into.
@@ -328,6 +356,7 @@ fn serve(args: Args) -> anyhow::Result<()> {
             interval: std::time::Duration::from_secs(args.poll_interval_secs.max(5)),
             ..MonitorConfig::default()
         },
+        ws_auth,
     };
 
     async_std::task::block_on(ws::run(server, controller, nodes, config))
