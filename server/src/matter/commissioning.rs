@@ -300,21 +300,88 @@ pub fn issue_credentials<C: Crypto>(
 }
 
 /// Re-encode a Matter TLV certificate as the X.509 DER it was derived from.
+///
+/// rs-matter's `as_asn1` yields only the `TBSCertificate` (what the signature
+/// covers), so this wraps it into the full `Certificate`:
+/// `SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }`.
 pub fn tlv_cert_to_der(tlv: &[u8]) -> Result<Vec<u8>, ApiError> {
     use rs_matter::cert::{CertRef, MAX_CERT_ASN1_LEN};
     use rs_matter::tlv::TLVElement;
 
-    let mut der = vec![0u8; MAX_CERT_ASN1_LEN];
+    /// Matter TLV certificate tag for the raw `r || s` signature.
+    const TAG_SIGNATURE: u8 = 11;
+    /// `AlgorithmIdentifier { ecdsa-with-SHA256 }`, no parameters. `as_asn1`
+    /// fails for any other algorithm, so the TBS always declares this one.
+    const ECDSA_WITH_SHA256: &[u8] = &[
+        0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+    ];
+
+    let err = |what: &str, e: rs_matter::error::Error| {
+        ApiError::sdk(format!(
+            "Could not encode a certificate as DER ({what}): {:?}",
+            e.code()
+        ))
+    };
+
+    let mut tbs = vec![0u8; MAX_CERT_ASN1_LEN];
     let len = CertRef::new(TLVElement::new(tlv))
-        .as_asn1(&mut der)
-        .map_err(|e| {
-            ApiError::sdk(format!(
-                "Could not encode a certificate as DER: {:?}",
-                e.code()
-            ))
-        })?;
-    der.truncate(len);
-    Ok(der)
+        .as_asn1(&mut tbs)
+        .map_err(|e| err("TBS", e))?;
+    tbs.truncate(len);
+
+    let raw_sig = TLVElement::new(tlv)
+        .structure()
+        .and_then(|s| s.find_ctx(TAG_SIGNATURE))
+        .and_then(|e| e.str())
+        .map_err(|e| err("signature", e))?;
+    if raw_sig.len() != 64 {
+        return Err(ApiError::sdk(format!(
+            "Could not encode a certificate as DER: {}-byte signature, expected 64",
+            raw_sig.len()
+        )));
+    }
+    let (r, s) = raw_sig.split_at(32);
+
+    // ECDSA-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+    let sig_value = der_tlv(0x30, &[der_uint(r), der_uint(s)].concat());
+    // signatureValue BIT STRING, no unused bits.
+    let sig_bits = der_tlv(0x03, &[&[0u8][..], &sig_value].concat());
+
+    Ok(der_tlv(
+        0x30,
+        &[&tbs[..], ECDSA_WITH_SHA256, &sig_bits].concat(),
+    ))
+}
+
+/// One DER element: tag, definite length, contents.
+fn der_tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
+    let len = contents.len();
+    let mut out = vec![tag];
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
+        out.push(0x80 | (bytes.len() - first) as u8);
+        out.extend_from_slice(&bytes[first..]);
+    }
+    out.extend_from_slice(contents);
+    out
+}
+
+/// A DER INTEGER from unsigned big-endian bytes: minimal, and non-negative.
+fn der_uint(be: &[u8]) -> Vec<u8> {
+    let first = be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1);
+    let digits = &be[first..];
+    let mut contents = Vec::with_capacity(digits.len() + 1);
+    if digits[0] & 0x80 != 0 {
+        contents.push(0);
+    }
+    contents.extend_from_slice(digits);
+    der_tlv(0x02, &contents)
 }
 
 /// Finish commissioning a device another commissioner installed our NOC on:
@@ -628,5 +695,56 @@ mod tests {
         assert_eq!(parse_pairing_code("   ").unwrap_err().code.as_i64(), 8);
         assert!(parse_pairing_code("not-a-code").is_err());
         assert!(parse_pairing_code("MT:GARBAGE").is_err());
+    }
+
+    /// A self-signed root from rs-matter's own cert tests (`RCA1_SUCCESS`).
+    const RCAC_TLV: &[u8] = &[
+        0x15, 0x30, 0x1, 0x1, 0x0, 0x24, 0x2, 0x1, 0x37, 0x3, 0x24, 0x14, 0x0, 0x24, 0x15, 0x1,
+        0x18, 0x26, 0x4, 0x80, 0x22, 0x81, 0x27, 0x26, 0x5, 0x80, 0x25, 0x4d, 0x3a, 0x37, 0x6,
+        0x24, 0x14, 0x0, 0x24, 0x15, 0x1, 0x18, 0x24, 0x7, 0x1, 0x24, 0x8, 0x1, 0x30, 0x9, 0x41,
+        0x4, 0x6d, 0x70, 0x7e, 0x4b, 0x98, 0xf6, 0x2b, 0xab, 0x44, 0xd6, 0xfe, 0xa3, 0x2e, 0x39,
+        0xd8, 0xc3, 0x0, 0xa0, 0xe, 0xa8, 0x6c, 0x83, 0xff, 0x69, 0xd, 0xe8, 0x42, 0x1, 0xeb, 0xd,
+        0xaa, 0x68, 0x5d, 0xcb, 0x97, 0x2, 0x80, 0x1d, 0xa8, 0x50, 0x2, 0x2e, 0x5a, 0xa2, 0x5a,
+        0x2e, 0x51, 0x26, 0x4, 0xd2, 0x39, 0x62, 0xcd, 0x82, 0x38, 0x63, 0x28, 0xbf, 0x15, 0x1c,
+        0xa6, 0x27, 0xe0, 0xd7, 0x37, 0xa, 0x35, 0x1, 0x29, 0x1, 0x18, 0x24, 0x2, 0x60, 0x30, 0x4,
+        0x14, 0xd4, 0x56, 0x93, 0xbe, 0x70, 0x79, 0xf4, 0x9c, 0x70, 0x6b, 0x7, 0x6f, 0x11, 0x1c,
+        0x6d, 0xe5, 0x64, 0xa4, 0x44, 0x74, 0x30, 0x5, 0x14, 0xd4, 0x56, 0x93, 0xbe, 0x70, 0x79,
+        0xf4, 0x9c, 0x70, 0x6b, 0x7, 0x6f, 0x11, 0x1c, 0x6d, 0xe5, 0x64, 0xa4, 0x44, 0x74, 0x18,
+        0x30, 0xb, 0x40, 0x3, 0xd, 0x77, 0xe1, 0x9e, 0xea, 0x9c, 0x5, 0x5c, 0xcc, 0x47, 0xe8, 0xb3,
+        0x18, 0x1a, 0xd1, 0x74, 0xee, 0xc6, 0x2e, 0xa1, 0x20, 0x16, 0xbd, 0x20, 0xb4, 0x3d, 0xac,
+        0x24, 0xbe, 0x17, 0xf9, 0xe, 0xb7, 0x9a, 0x98, 0xc8, 0xbc, 0x6a, 0xce, 0x99, 0x2a, 0x2e,
+        0x63, 0x4c, 0x76, 0x6, 0x45, 0x93, 0xd3, 0x7c, 0x4, 0x0, 0xe4, 0xc7, 0x78, 0xe9, 0x83,
+        0x5b, 0xc, 0x33, 0x61, 0x5c, 0x2e, 0x18,
+    ];
+
+    #[test]
+    fn der_certificates_are_complete_and_their_signatures_verify() {
+        use p256::ecdsa::signature::Verifier;
+        use p256::ecdsa::{Signature, VerifyingKey};
+        use x509_cert::der::{Decode, Encode};
+
+        let der = tlv_cert_to_der(RCAC_TLV).unwrap();
+        // A full Certificate, not just its TBSCertificate (what the CHIP SDK
+        // rejected with ASN1_ERROR_INVALID_ENCODING), with nothing trailing.
+        let cert = x509_cert::Certificate::from_der(&der).unwrap();
+
+        let tbs = cert.tbs_certificate().to_der().unwrap();
+        let key = VerifyingKey::from_sec1_bytes(
+            cert.tbs_certificate()
+                .subject_public_key_info()
+                .subject_public_key
+                .raw_bytes(),
+        )
+        .unwrap();
+        let sig = Signature::from_der(cert.signature().raw_bytes()).unwrap();
+        key.verify(&tbs, &sig).expect("self-signature verifies");
+    }
+
+    #[test]
+    fn der_integers_are_minimal_and_non_negative() {
+        assert_eq!(der_uint(&[0, 0, 0x7f]), [0x02, 0x01, 0x7f]);
+        assert_eq!(der_uint(&[0, 0x80]), [0x02, 0x02, 0x00, 0x80]);
+        assert_eq!(der_uint(&[0, 0]), [0x02, 0x01, 0x00]);
+        assert_eq!(der_tlv(0x30, &[0; 200])[..3], [0x30, 0x81, 200]);
     }
 }
