@@ -111,6 +111,13 @@ pub async fn run(
         thread::spawn(move || block_on(monitor::run(context, monitor_config)));
     }
 
+    // Commands are confirmed off the request path, so a connection is not
+    // held up waiting for a device's report.
+    {
+        let context = context.clone();
+        thread::spawn(move || crate::confirm::run(context));
+    }
+
     // The topology watcher only reads the node store and the event stream, so
     // it needs neither Matter nor a connection.
     {

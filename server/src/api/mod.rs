@@ -147,6 +147,8 @@ pub struct ServerContext {
     /// The subscriptions this controller holds, shared between the monitor
     /// that establishes them and the report handler that receives them.
     pub subscriptions: subscriptions::Registry,
+    /// Commands whose effect is still to be confirmed; see [`crate::confirm`].
+    pub confirmations: crate::confirm::Queue,
     /// The Thread networks' diagnostics, as last collected.
     pub thread_diagnostics: ThreadDiagnosticsCache,
     /// When each intermittently connected device last checked in.
@@ -193,6 +195,7 @@ impl ServerContext {
             runtime,
             ota: ota::OtaUploadRegistry::new(),
             subscriptions: subscriptions::Registry::new(),
+            confirmations: crate::confirm::Queue::new(),
             thread_diagnostics: ThreadDiagnosticsCache::new(),
             check_ins: Mutex::new(BTreeMap::new()),
             dcl: DclClient::main_net(),

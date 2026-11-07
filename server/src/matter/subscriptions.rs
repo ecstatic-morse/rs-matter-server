@@ -75,6 +75,22 @@ impl Registry {
         }
     }
 
+    /// Whether this server holds a subscription on the node at all, live or
+    /// not.
+    pub fn holds(&self, node_id: u64) -> bool {
+        self.entries.lock().unwrap().contains_key(&node_id)
+    }
+
+    /// Whether the node's subscription produced a report (or was established,
+    /// which comes with one) after `when`.
+    pub fn reported_since(&self, node_id: u64, when: Instant) -> bool {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(&node_id)
+            .is_some_and(|entry| entry.last_report > when)
+    }
+
     /// Forget a node's subscription — it was torn down, or the node is gone.
     pub fn forget(&self, node_id: u64) {
         self.entries.lock().unwrap().remove(&node_id);

@@ -10,6 +10,7 @@
 //! - `ws`       — the listener, connection lifecycle, and HTTP endpoints
 
 pub mod api;
+pub mod confirm;
 pub mod matter;
 pub mod migrate;
 pub mod monitor;

@@ -10,7 +10,7 @@ use crate::protocol::error::{ApiError, ApiResult};
 use crate::protocol::events::Event;
 use crate::protocol::message::Args;
 use crate::protocol::model::AttributesData;
-use crate::protocol::paths::{format_path, parse_path, parse_path_arg, parse_write_path};
+use crate::protocol::paths::{format_path, parse_path_arg, parse_write_path};
 
 use super::{require_node, CallContext};
 
@@ -44,38 +44,6 @@ pub fn publish_attribute_changes(
         context.server.nodes.save_soon();
     }
     changed
-}
-
-/// Read an endpoint back after a command so clients see its effect at once.
-///
-/// Without device-initiated subscriptions there is nothing to tell a client
-/// that a command changed something, so it would otherwise wait for the next
-/// poll — the difference between a light that responds instantly in the UI and
-/// one that appears to lag by half a minute. The whole endpoint is read rather
-/// than just the targeted cluster because commands routinely change another:
-/// `moveToLevelWithOnOff` moves LevelControl *and* OnOff.
-async fn refresh_endpoint(context: CallContext<'_>, node_id: u64, endpoint: u16) {
-    let Ok(path) = parse_path(&format!("{}/*/*", endpoint)) else {
-        return;
-    };
-    match context
-        .server
-        .matter
-        .read_attributes(node_id, vec![path.to_attr_path()], false)
-        .await
-    {
-        Ok(attributes) => {
-            publish_attribute_changes(context, node_id, &attributes);
-        }
-        // The command already succeeded; failing to read back is not a reason
-        // to report it as failed.
-        Err(error) => log::debug!(
-            "Could not read endpoint {} of node {} back after a command: {}",
-            endpoint,
-            node_id,
-            error
-        ),
-    }
 }
 
 pub async fn read_attribute(args: &Args, context: CallContext<'_>) -> ApiResult {
@@ -212,6 +180,7 @@ pub async fn device_command(args: &Args, context: CallContext<'_>) -> ApiResult 
         _ => return Err(ApiError::invalid_args("payload must be an object")),
     };
 
+    let sent = std::time::Instant::now();
     let response = context
         .server
         .matter
@@ -226,7 +195,18 @@ pub async fn device_command(args: &Args, context: CallContext<'_>) -> ApiResult 
         )
         .await?;
 
-    refresh_endpoint(context, node_id, endpoint).await;
+    // A subscribed node reports the command's effect itself; it is read back
+    // only if it does not (see `crate::confirm`). One without a subscription
+    // is read back at once, or nothing would tell clients until the next poll.
+    let after = if context.server.subscriptions.holds(node_id) {
+        crate::confirm::REPORT_WITHIN
+    } else {
+        std::time::Duration::ZERO
+    };
+    context
+        .server
+        .confirmations
+        .request(node_id, endpoint, sent, after);
     Ok(response)
 }
 
