@@ -477,6 +477,11 @@ pub fn set_group_key(
     key_set_id: u16,
     epoch_key: &[u8],
 ) -> Result<(), ApiError> {
+    if key_set_id == group_keys::IPK_KEY_SET_ID {
+        return Err(ApiError::invalid_args(
+            "key_set_id 0 is the fabric's IPK, not a group key set",
+        ));
+    }
     let epoch_key = group_keys::EpochKey::try_from(epoch_key)
         .map_err(|_| ApiError::invalid_args("epoch_key must be 16 bytes"))?;
     update_group_keys(matter, fabric_index, storage_path, |keys| {

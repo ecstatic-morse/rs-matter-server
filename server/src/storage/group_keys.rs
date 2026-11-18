@@ -4,10 +4,10 @@
 //! them, but are persisted here, in a file of their own, rather than through
 //! the fabric blob: a build without rs-matter's `groups` feature must go on
 //! loading the fabric exactly as it always has, and anything this file holds
-//! is simply never read by it. The file is authoritative — at startup the
-//! fabric's key sets and group map are replaced by what it says — so a copy
-//! that ended up in the fabric blob (every `persist_fabric` writes the
-//! in-memory groups too) can't bring back a key that was removed.
+//! is simply never read by it. `persist_fabric` leaves the groups out of the
+//! blob, and the file is authoritative: at startup the fabric's key sets and
+//! group map are replaced by what it says, so a copy in a blob written by an
+//! earlier build can't bring back a key that was removed.
 //!
 //! ```json
 //! {"version": 1,
@@ -34,6 +34,9 @@ const VERSION: u32 = 1;
 pub const EPOCH_KEY_LEN: usize = 16;
 
 pub type EpochKey = [u8; EPOCH_KEY_LEN];
+
+/// Key set 0 is the fabric's Identity Protection Key, never a group's.
+pub const IPK_KEY_SET_ID: u16 = 0;
 
 /// Key sets by id, and the key set each group is encrypted with.
 ///
@@ -91,6 +94,9 @@ impl GroupKeys {
         }
         let mut keys = GroupKeys::default();
         for entry in file.key_sets {
+            if entry.key_set_id == IPK_KEY_SET_ID {
+                bail!("key set 0 is the IPK, not a group key set");
+            }
             let key = BASE64
                 .decode(&entry.epoch_key)
                 .ok()
@@ -263,6 +269,7 @@ mod tests {
             r#"{"version": 2, "key_sets": [], "groups": []}"#,
             r#"{"version": 1, "key_sets": [{"key_set_id": 1, "epoch_key": "AAAA"}], "groups": []}"#,
             r#"{"version": 1, "key_sets": [], "groups": [{"group_id": 1, "key_set_id": 1}]}"#,
+            r#"{"version": 1, "key_sets": [{"key_set_id": 0, "epoch_key": "AAAAAAAAAAAAAAAAAAAAAA=="}], "groups": []}"#,
         ];
         for contents in bad {
             let dir = tempfile::tempdir().unwrap();

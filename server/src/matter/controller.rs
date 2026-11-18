@@ -313,12 +313,35 @@ fn install_fabric(matter: &Matter<'_>, imported: &ImportedFabric) -> Result<Cano
     Ok(issuer_key)
 }
 
+/// Store the controller's fabric, without its groups.
+///
+/// The group keys are persisted in a file of their own (see
+/// [`crate::storage::group_keys`]), which is what restores them, so the blob
+/// has no use for them; and keeping them out means a blob written here never
+/// carries group data a build without rs-matter's `groups` feature, or with
+/// smaller group tables, might have to decode. The groups are taken off the
+/// fabric for the store and put straight back, all inside one `with_state`,
+/// so nothing sees the fabric without them.
+///
+/// This is the only place the fabric is stored: rs-matter stores it itself
+/// only from the clusters a node hosts to be administered (Access Control,
+/// Operational Credentials, General Commissioning, Groups, Group Key
+/// Management, Groupcast), and the controller's node hosts none of them.
 pub fn persist_fabric(matter: &Matter<'_>, storage_path: &Path) -> Result<()> {
     let kv = matter.kv(DirKvBlobStore::new(storage_path.to_path_buf()));
     let mut persist = FabricPersist::new(kv);
     matter.with_state(|state| {
-        let fabric = state.fabrics.iter().next().ok_or(ErrorCode::NotFound)?;
-        persist.store(fabric)
+        let fab_idx = state
+            .fabrics
+            .iter()
+            .next()
+            .ok_or(ErrorCode::NotFound)?
+            .fab_idx();
+        let fabric = state.fabrics.fabric_mut(fab_idx)?;
+        let groups = core::mem::take(fabric.groups_mut());
+        let stored = persist.store(fabric);
+        *fabric.groups_mut() = groups;
+        stored
     })?;
     persist.run()?;
     Ok(())

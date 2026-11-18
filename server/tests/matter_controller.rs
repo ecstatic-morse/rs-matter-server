@@ -93,9 +93,9 @@ fn fabric_creation_is_not_flaky() {
     );
 }
 
-/// Group keys come back after a restart from their own file, and that file,
-/// not the copy every `persist_fabric` also writes into the fabric blob,
-/// decides: a key removed before the restart stays removed.
+/// Group keys come back after a restart from their own file, and that file
+/// decides: a key removed before the restart stays removed, even with the
+/// fabric stored in between.
 #[test]
 fn group_keys_survive_a_restart_and_removals_stick() {
     use rs_matter_server::matter::controller::{init_controller, persist_fabric};
@@ -117,7 +117,6 @@ fn group_keys_survive_a_restart_and_removals_stick() {
         set_group_key(matter, fabric, storage, 7, 1, &[0x11; 16]).unwrap();
         set_group_key(matter, fabric, storage, 8, 1, &[0x11; 16]).unwrap();
         set_group_key(matter, fabric, storage, 9, 2, &[0x22; 16]).unwrap();
-        // The fabric blob now carries all three too.
         persist_fabric(matter, storage).unwrap();
         remove_group_key(matter, fabric, storage, 9).unwrap();
 
@@ -166,6 +165,54 @@ fn a_corrupt_group_key_file_does_not_stop_startup() {
         .groups
         .is_empty());
     assert!(tmp.path().join("group-keys.json.corrupt").exists());
+}
+
+/// The stored fabric blob never carries groups: they are restored from
+/// `group-keys.json` alone, and a build without group support (or with
+/// smaller group tables) never meets them in the blob.
+#[test]
+fn the_fabric_blob_carries_no_group_data() {
+    use rs_matter::fabric::Groups;
+    use rs_matter::tlv::{FromTLV, TLVElement};
+    use rs_matter_server::matter::controller::{init_controller, persist_fabric};
+    use rs_matter_server::matter::interaction::{group_keys, set_group_key};
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().to_str().unwrap().to_string();
+    let fab_idx = {
+        let controller = init_controller(&path, &FabricConfig::default()).expect("init");
+        let (matter, storage) = (&controller.matter, &controller.storage_path);
+        let fabric = matter
+            .with_state(|state| state.fabrics.iter().next().map(|f| f.fab_idx()))
+            .unwrap();
+        set_group_key(matter, fabric, storage, 7, 1, &[0x11; 16]).unwrap();
+        persist_fabric(matter, storage).unwrap();
+        // Still on the fabric in memory after the store.
+        assert_eq!(group_keys(matter, fabric).unwrap().groups.len(), 1);
+        fabric
+    };
+
+    // rs-matter's directory store: one file per key, the fabric at its index.
+    let blob = std::fs::read(tmp.path().join(format!("k_{:04x}", fab_idx.get()))).unwrap();
+    let element = TLVElement::new(&blob)
+        .structure()
+        .unwrap()
+        .find_ctx(13)
+        .unwrap();
+    if !element.is_empty() {
+        let groups = Groups::from_tlv(&element).unwrap();
+        assert_eq!(groups.key_set_iter().count(), 0);
+        assert_eq!(groups.key_map_iter().count(), 0);
+        assert_eq!(groups.iter().count(), 0);
+    }
+
+    // And with the file gone, nothing brings the key back.
+    std::fs::remove_file(tmp.path().join("group-keys.json")).unwrap();
+    let controller = init_controller(&path, &FabricConfig::default()).expect("reload");
+    assert_eq!(
+        group_keys(&controller.matter, fab_idx).unwrap(),
+        Default::default()
+    );
 }
 
 /// A key the fabric has no room for is refused, and leaves the keys already

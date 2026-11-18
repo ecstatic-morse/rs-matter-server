@@ -227,6 +227,11 @@ pub async fn set_group_key(args: &Args, context: CallContext<'_>) -> ApiResult {
     let key_set_id = args
         .u16("key_set_id")?
         .ok_or_else(|| ApiError::invalid_args("Missing key_set_id"))?;
+    if key_set_id == crate::storage::group_keys::IPK_KEY_SET_ID {
+        return Err(ApiError::invalid_args(
+            "key_set_id 0 is the fabric's IPK, not a group key set",
+        ));
+    }
     let epoch_key = args
         .str("epoch_key")?
         .ok_or_else(|| ApiError::invalid_args("Missing epoch_key"))?;
@@ -490,6 +495,11 @@ mod tests {
             .contains("Missing group_id"));
         assert!(details(json!({ "group_id": 1, "epoch_key": "" }), false)
             .contains("Missing key_set_id"));
+        assert!(details(
+            json!({ "group_id": 1, "key_set_id": 0, "epoch_key": "" }),
+            false
+        )
+        .contains("IPK"));
         assert!(
             details(json!({ "group_id": 1, "key_set_id": 1 }), false).contains("Missing epoch_key")
         );

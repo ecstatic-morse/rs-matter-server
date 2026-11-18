@@ -158,11 +158,12 @@ commands give this controller the same key and send to the group.
 
 - **`set_group_key`** `{ group_id, key_set_id, epoch_key }` — `epoch_key` is
   the base64 16-byte key the members were given in key set `key_set_id`.
-  Answers `null`. Persisted (`group-keys.json` in the storage directory,
-  owner-only, apart from the fabric so a build without group support still
-  loads it) and restored at startup; the same key again writes nothing. A key
-  set is shared by the groups mapped to it: a new key under a `key_set_id`
-  replaces it for all of them.
+  `key_set_id` 0 (the IPK) is refused. Answers `null`. Persisted
+  (`group-keys.json` in the storage directory, owner-only) and restored at
+  startup; the same key again writes nothing. The stored fabric never carries
+  groups, so a build without group support loads it unchanged. A key set is
+  shared by the groups mapped to it: a new key under a `key_set_id` replaces
+  it for all of them.
 - **`remove_group_key`** `{ group_id }` — unmaps the group, and drops its key
   set once no other group uses it. Answers `null`, also for a group with no
   key.
@@ -174,8 +175,8 @@ commands give this controller the same key and send to the group.
   every interface that leads to one by its last known address. Answers
   `{ interfaces, unaddressed_node_ids }`.
 
-rs-matter's defaults bound the controller's fabric to 3 key sets and 4 mapped
-groups; past that `set_group_key` fails and changes nothing. A
+The controller's fabric holds up to 3 key sets and 32 mapped groups; past
+that `set_group_key` fails and changes nothing. A
 `group-keys.json` that can't be read is logged, renamed
 `group-keys.json.corrupt`, and the server starts with no group keys.
 
