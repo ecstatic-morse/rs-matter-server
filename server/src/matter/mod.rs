@@ -8,6 +8,7 @@ pub mod clusters;
 pub mod commissioning;
 pub mod controller;
 pub mod dcl;
+pub mod groupcast;
 pub mod interaction;
 pub mod mdns_browser;
 pub mod nodes;

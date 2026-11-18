@@ -160,8 +160,20 @@ pub async fn run(
     // deliberately: `Matter` is `!Send`, and rs-matter's responder is written
     // as one future running several handlers concurrently, so it needs no
     // thread or executor of its own.
+    let groupcast = Groupcast {
+        socket: crate::matter::groupcast::bind_socket()
+            .context("binding the socket for Matter group messages")?,
+        routes: context.group_routes.clone(),
+    };
     let network = futures_lite::future::or(
-        run_transport(&matter, &crypto, &matter_socket, &matter_tcp, &ble),
+        run_transport(
+            &matter,
+            &crypto,
+            &matter_socket,
+            &matter_tcp,
+            &ble,
+            &groupcast,
+        ),
         futures_lite::future::or(
             run_mdns(&matter, &crypto, &mdns),
             responder::run(&matter, &crypto, responder_storage, context.clone()),
@@ -199,13 +211,14 @@ async fn run_transport<C: Crypto>(
     socket: &Async<UdpSocket>,
     tcp: &MatterTcp,
     ble: &BleSetup,
+    groupcast: &Groupcast,
 ) {
     // Two chains rather than one: `run` takes send and receive separately, and
     // each needs its own value to borrow mutably.
     let send = ChainedNetwork::new(
         Address::is_btp,
         &ble.btp,
-        ChainedNetwork::new(Address::is_tcp, tcp, socket),
+        ChainedNetwork::new(Address::is_tcp, tcp, groupcast.sender(socket)),
     );
     let recv = ChainedNetwork::new(
         Address::is_btp,
@@ -225,12 +238,35 @@ async fn run_transport<C: Crypto>(
     socket: &Async<UdpSocket>,
     tcp: &MatterTcp,
     _ble: &BleSetup,
+    groupcast: &Groupcast,
 ) {
-    let send = ChainedNetwork::new(Address::is_tcp, tcp, socket);
+    let send = ChainedNetwork::new(Address::is_tcp, tcp, groupcast.sender(socket));
     let recv = ChainedNetwork::new(Address::is_tcp, tcp, socket);
 
     if let Err(error) = matter.run(crypto, send, recv, socket).await {
         log::error!("Matter transport stopped: {:?}", error);
+    }
+}
+
+/// Group messages' own socket and the interfaces each group goes out of; see
+/// [`crate::matter::groupcast`].
+struct Groupcast {
+    socket: Async<UdpSocket>,
+    routes: Arc<crate::matter::groupcast::GroupRoutes>,
+}
+
+impl Groupcast {
+    /// The transport's UDP sender, with group datagrams sent out of their
+    /// members' interfaces.
+    fn sender<'a>(
+        &'a self,
+        socket: &'a Async<UdpSocket>,
+    ) -> crate::matter::groupcast::GroupcastSend<'a, &'a Async<UdpSocket>> {
+        crate::matter::groupcast::GroupcastSend {
+            inner: socket,
+            socket: &self.socket,
+            routes: &self.routes,
+        }
     }
 }
 

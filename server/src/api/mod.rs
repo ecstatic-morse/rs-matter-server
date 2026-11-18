@@ -176,6 +176,9 @@ pub struct ServerContext {
     /// The bearer token every WebSocket upgrade must carry, or `None` for an
     /// unauthenticated endpoint (the reference's behaviour). A fork extension.
     pub ws_auth: Option<crate::ws::auth::AuthToken>,
+    /// The interfaces each Matter group's messages go out of; filled by
+    /// `group_command`, read by the transport. A fork extension.
+    pub group_routes: Arc<crate::matter::groupcast::GroupRoutes>,
 }
 
 impl ServerContext {
@@ -207,6 +210,7 @@ impl ServerContext {
             fabric: Mutex::new(None),
             issued_nocs: Mutex::new(BTreeMap::new()),
             ws_auth: None,
+            group_routes: Arc::default(),
         }
     }
 

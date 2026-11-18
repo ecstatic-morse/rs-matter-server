@@ -238,12 +238,30 @@ pub async fn set_group_key(args: &Args, context: CallContext<'_>) -> ApiResult {
 
 /// Send a command to a Matter group as one multicast message (an
 /// rs-matter-server extension): `group_id`, `cluster_id`, `command_name` (or
-/// `command_id`) and `payload`, as for `device_command` but with no endpoint
-/// or node. Returns once the message is out; members don't answer.
+/// `command_id`) and `payload`, as for `device_command` but with no endpoint;
+/// `node_ids`, the group's members.
+///
+/// The message goes out of every interface that leads to a member (see
+/// [`crate::matter::groupcast`]), worked out from the members' last known
+/// operational addresses. Returns once it is out, with the interfaces used
+/// and the members with no known address, which it can't have reached;
+/// members don't answer.
 pub async fn group_command(args: &Args, context: CallContext<'_>) -> ApiResult {
+    use crate::matter::groupcast;
+
     let group_id = args
         .u16("group_id")?
         .ok_or_else(|| ApiError::invalid_args("Missing group_id"))?;
+    let node_ids: Vec<u64> = match args.value("node_ids") {
+        Some(Value::Array(ids)) => ids
+            .iter()
+            .map(|id| {
+                id.as_u64()
+                    .ok_or_else(|| ApiError::invalid_args("node_ids must be integers"))
+            })
+            .collect::<Result<_, _>>()?,
+        _ => return Err(ApiError::invalid_args("Missing node_ids")),
+    };
     let cluster = args
         .u32("cluster_id")?
         .ok_or_else(|| ApiError::invalid_args("Missing cluster_id"))?;
@@ -260,12 +278,35 @@ pub async fn group_command(args: &Args, context: CallContext<'_>) -> ApiResult {
     if !matches!(encoded, TlvNode::Struct(_)) {
         return Err(ApiError::invalid_args("payload must be an object"));
     }
+
+    let mut unaddressed = Vec::new();
+    let mut addresses = Vec::new();
+    for &node_id in &node_ids {
+        let known = context.server.nodes.ip_addresses(node_id);
+        if known.iter().all(|a| groupcast::parse_address(a).is_none()) {
+            unaddressed.push(node_id);
+        }
+        addresses.extend(known);
+    }
+    let interfaces = groupcast::interfaces_for(addresses.iter().map(String::as_str));
+    if interfaces.is_empty() {
+        return Err(ApiError::invalid_args(
+            "No member has a known IPv6 address to route the group message by",
+        ));
+    }
+    let fabric = context.server.fabric_info().await?;
+    let address = rs_matter::utils::ipv6::compute_group_multicast_addr(fabric.fabric_id, group_id);
+    context.server.group_routes.set(address, interfaces.clone());
+
     context
         .server
         .matter
         .group_invoke(group_id, cluster, command.id, encoded)
         .await?;
-    Ok(Value::Null)
+    Ok(json!({
+        "interfaces": interfaces.iter().map(|&i| groupcast::interface_name(i)).collect::<Vec<_>>(),
+        "unaddressed_node_ids": unaddressed,
+    }))
 }
 
 /// Timed interactions are requested in milliseconds and capped at what the
