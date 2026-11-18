@@ -212,7 +212,12 @@ pub async fn device_command(args: &Args, context: CallContext<'_>) -> ApiResult 
 
 /// Give this controller a Matter group's key (an rs-matter-server extension):
 /// `group_id`, `key_set_id` and `epoch_key` (base64, 16 bytes), the same key
-/// set the group's members were given with `KeySetWrite`. Kept in memory only.
+/// set the group's members were given with `KeySetWrite`.
+///
+/// Persisted in the storage directory and put back on the fabric at startup,
+/// so a client sets a key once, not after every restart; setting the same key
+/// again changes nothing. One key set can serve several groups, and a new key
+/// under a `key_set_id` replaces it for all of them.
 pub async fn set_group_key(args: &Args, context: CallContext<'_>) -> ApiResult {
     use base64::Engine as _;
 
@@ -228,12 +233,33 @@ pub async fn set_group_key(args: &Args, context: CallContext<'_>) -> ApiResult {
     let epoch_key = base64::engine::general_purpose::STANDARD
         .decode(epoch_key)
         .map_err(|_| ApiError::invalid_args("epoch_key must be base64"))?;
+    if epoch_key.len() != crate::storage::group_keys::EPOCH_KEY_LEN {
+        return Err(ApiError::invalid_args("epoch_key must be 16 bytes"));
+    }
     context
         .server
         .matter
         .set_group_key(group_id, key_set_id, epoch_key)
         .await?;
     Ok(Value::Null)
+}
+
+/// Take a Matter group's key off this controller (an rs-matter-server
+/// extension): `group_id`. The key set goes too once no other group uses it.
+/// Persisted; a group with no key is not an error.
+pub async fn remove_group_key(args: &Args, context: CallContext<'_>) -> ApiResult {
+    let group_id = args
+        .u16("group_id")?
+        .ok_or_else(|| ApiError::invalid_args("Missing group_id"))?;
+    context.server.matter.remove_group_key(group_id).await?;
+    Ok(Value::Null)
+}
+
+/// The groups this controller has a key for (an rs-matter-server extension):
+/// `[{group_id, key_set_id}]`, by group id, for a client to check it is in
+/// sync. The keys themselves never leave the server.
+pub async fn get_group_keys(_args: &Args, context: CallContext<'_>) -> ApiResult {
+    context.server.matter.group_keys().await
 }
 
 /// Send a command to a Matter group as one multicast message (an
@@ -443,6 +469,42 @@ mod tests {
             events.try_recv().unwrap().payload["data"],
             json!([1, "1/6/0", false])
         );
+    }
+
+    #[test]
+    fn group_keys_are_checked_before_reaching_matter() {
+        let context = test_context();
+        let details = |args: Value, remove: bool| {
+            let args = Args::new(args);
+            let error = if remove {
+                block_on(remove_group_key(&args, call(&context)))
+            } else {
+                block_on(set_group_key(&args, call(&context)))
+            }
+            .unwrap_err();
+            assert_eq!(error.code.as_i64(), 8, "{}", error.details);
+            error.details
+        };
+
+        assert!(details(json!({ "key_set_id": 1, "epoch_key": "" }), false)
+            .contains("Missing group_id"));
+        assert!(details(json!({ "group_id": 1, "epoch_key": "" }), false)
+            .contains("Missing key_set_id"));
+        assert!(
+            details(json!({ "group_id": 1, "key_set_id": 1 }), false).contains("Missing epoch_key")
+        );
+        assert!(details(
+            json!({ "group_id": 1, "key_set_id": 1, "epoch_key": "!" }),
+            false
+        )
+        .contains("base64"));
+        // 15 bytes.
+        assert!(details(
+            json!({ "group_id": 1, "key_set_id": 1, "epoch_key": "AAAAAAAAAAAAAAAAAAAA" }),
+            false
+        )
+        .contains("16 bytes"));
+        assert!(details(json!({}), true).contains("Missing group_id"));
     }
 
     #[test]

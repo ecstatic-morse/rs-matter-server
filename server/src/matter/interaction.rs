@@ -22,6 +22,7 @@ use rs_matter::Matter;
 use crate::protocol::error::{ApiError, ErrorCode as ProtocolError};
 use crate::protocol::model::AttributesData;
 use crate::protocol::paths::format_path;
+use crate::storage::group_keys::{self, GroupKeys};
 
 use super::tlv_json::{self, TlvNode};
 
@@ -460,42 +461,169 @@ pub async fn group_invoke<C: Crypto>(
         .map_err(|e| im_error("group invoke", e))
 }
 
-/// Put a group's key on this controller's own fabric, so it can encrypt
-/// messages to the group: key set `key_set_id` holding `epoch_key` (16
-/// bytes), mapped to `group_id`. In memory only: not persisted.
+/// Give this controller a group's key, so it can encrypt messages to the
+/// group: key set `key_set_id` holding `epoch_key` (16 bytes), mapped to
+/// `group_id`, on its own fabric and in `storage_path` (see
+/// [`crate::storage::group_keys`]), so a restart keeps it.
+///
+/// Setting what is already there writes nothing. A key set is shared by every
+/// group mapped to it, so a new key under an existing `key_set_id` changes it
+/// for all of them.
 pub fn set_group_key(
     matter: &Matter<'_>,
     fabric_index: NonZeroU8,
+    storage_path: &std::path::Path,
     group_id: u16,
     key_set_id: u16,
     epoch_key: &[u8],
 ) -> Result<(), ApiError> {
-    use rs_matter::group_keys::{GroupEpochKeyEntry, GroupKeySet};
-
-    let mut key = GroupEpochKeyEntry {
-        epoch_key: Default::default(),
-        // As rs-matter's own Groupcast cluster does; the device gets the same.
-        epoch_start_time: 1,
-    };
-    key.epoch_key
-        .try_load_from_slice(epoch_key)
+    let epoch_key = group_keys::EpochKey::try_from(epoch_key)
         .map_err(|_| ApiError::invalid_args("epoch_key must be 16 bytes"))?;
-    let mut set = GroupKeySet {
-        group_key_set_id: key_set_id,
-        // TrustFirst.
-        group_key_security_policy: 0,
-        ..Default::default()
+    update_group_keys(matter, fabric_index, storage_path, |keys| {
+        keys.set(group_id, key_set_id, epoch_key)
+    })
+}
+
+/// Take a group's key off this controller, and the key set with it once no
+/// other group uses it; persisted as [`set_group_key`] is. A group with no
+/// key is left as it is.
+pub fn remove_group_key(
+    matter: &Matter<'_>,
+    fabric_index: NonZeroU8,
+    storage_path: &std::path::Path,
+    group_id: u16,
+) -> Result<(), ApiError> {
+    update_group_keys(matter, fabric_index, storage_path, |keys| {
+        keys.remove(group_id)
+    })
+}
+
+/// Change the group keys, on the fabric and then on disk, or not at all: if
+/// either step fails the fabric gets back what it had, so memory never holds
+/// a key the next restart would lose.
+fn update_group_keys(
+    matter: &Matter<'_>,
+    fabric_index: NonZeroU8,
+    storage_path: &std::path::Path,
+    change: impl FnOnce(&mut GroupKeys),
+) -> Result<(), ApiError> {
+    let before = group_keys(matter, fabric_index)?;
+    let mut after = before.clone();
+    change(&mut after);
+    if after == before {
+        return Ok(());
+    }
+
+    let restore = |error: ApiError| {
+        if let Err(e) = install_group_keys(matter, fabric_index, &before) {
+            log::error!("Could not restore the group keys: {:?}", e.code());
+        }
+        error
     };
-    set.epoch_keys
-        .push(key)
-        .map_err(|_| ApiError::sdk("epoch key list full"))?;
+    install_group_keys(matter, fabric_index, &after)
+        .map_err(|e| restore(im_error("group key", e)))?;
+    group_keys::save(storage_path, &after).map_err(|e| {
+        restore(ApiError::sdk(format!(
+            "Failed to persist the group keys: {e:#}"
+        )))
+    })
+}
+
+/// The group keys on this controller's fabric. Only the first epoch key of
+/// each set counts: only one is ever put there.
+pub fn group_keys(matter: &Matter<'_>, fabric_index: NonZeroU8) -> Result<GroupKeys, ApiError> {
     matter
         .with_state(|state| {
-            let groups = state.fabrics.fabric_mut(fabric_index)?.groups_mut();
-            groups.key_set_add(set)?;
-            groups.key_map_set_group(group_id, key_set_id)
+            let groups = state
+                .fabrics
+                .get(fabric_index)
+                .ok_or(ErrorCode::NotFound)?
+                .groups();
+            let mut keys = GroupKeys::default();
+            for set in groups.key_set_iter() {
+                if let Some(entry) = set.epoch_keys.first() {
+                    keys.key_sets
+                        .insert(set.group_key_set_id, *entry.epoch_key.access());
+                }
+            }
+            for mapping in groups.key_map_iter() {
+                keys.groups
+                    .insert(mapping.group_id, mapping.group_key_set_id);
+            }
+            Ok(keys)
         })
-        .map_err(|e| im_error("group key", e))
+        .map_err(|e| im_error("group keys", e))
+}
+
+/// Make the key sets and group map on this controller's fabric exactly
+/// `keys`, dropping whatever else is there. The group table (which endpoints
+/// are in which group) is not touched: a controller puts none of its own
+/// endpoints in groups.
+pub fn install_group_keys(
+    matter: &Matter<'_>,
+    fabric_index: NonZeroU8,
+    keys: &GroupKeys,
+) -> Result<(), rs_matter::error::Error> {
+    use rs_matter::group_keys::{GroupEpochKeyEntry, GroupKeySet};
+
+    let mut sets = Vec::with_capacity(keys.key_sets.len());
+    for (&key_set_id, epoch_key) in &keys.key_sets {
+        let mut key = GroupEpochKeyEntry {
+            epoch_key: Default::default(),
+            // As rs-matter's own Groupcast cluster does; the device gets the same.
+            epoch_start_time: 1,
+        };
+        key.epoch_key.load_from_array(epoch_key);
+        let mut set = GroupKeySet {
+            group_key_set_id: key_set_id,
+            // TrustFirst.
+            group_key_security_policy: 0,
+            ..Default::default()
+        };
+        set.epoch_keys
+            .push(key)
+            .map_err(|_| ErrorCode::ResourceExhausted)?;
+        sets.push(set);
+    }
+
+    matter.with_state(|state| {
+        let groups = state.fabrics.fabric_mut(fabric_index)?.groups_mut();
+        let existing: Vec<u16> = groups.key_set_iter().map(|s| s.group_key_set_id).collect();
+        for key_set_id in existing {
+            groups.key_set_remove(key_set_id)?;
+        }
+        groups.key_map_replace(core::iter::empty())?;
+        for set in sets {
+            groups.key_set_add(set)?;
+        }
+        for (&group_id, &key_set_id) in &keys.groups {
+            groups.key_map_set_group(group_id, key_set_id)?;
+        }
+        Ok(())
+    })
+}
+
+/// Put the persisted group keys on the fabric at startup. Nothing here stops
+/// the server: a file it can't read, or keys the fabric has no room for, are
+/// logged, and it starts without them.
+pub fn restore_group_keys(matter: &Matter<'_>, storage_path: &std::path::Path) {
+    let Some(fabric_index) =
+        matter.with_state(|state| state.fabrics.iter().next().map(|fabric| fabric.fab_idx()))
+    else {
+        return;
+    };
+    let keys = group_keys::load_for_startup(storage_path);
+    if let Err(error) = install_group_keys(matter, fabric_index, &keys) {
+        log::error!(
+            "Starting without Matter group keys: the fabric has no room for {} key sets and {} groups ({:?})",
+            keys.key_sets.len(),
+            keys.groups.len(),
+            error.code()
+        );
+        let _ = install_group_keys(matter, fabric_index, &GroupKeys::default());
+    } else if !keys.groups.is_empty() {
+        log::info!("Restored the keys of {} Matter groups", keys.groups.len());
+    }
 }
 
 /// Basic Information lives on the root endpoint of every node, and

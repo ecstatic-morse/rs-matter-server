@@ -149,6 +149,36 @@ never sees `server_info`. Nothing changes once connected. Unset, the endpoint is
 open, as the reference's is, and the server logs a warning at startup.
 `/health` is never guarded.
 
+### Matter groups
+
+For sending one multicast command to a group of devices. Setting the group up
+on the devices — `KeySetWrite`, `GroupKeyMap`, `AddGroup` and a Group-auth ACL
+entry — is the client's, through `device_command` and `write_attribute`; these
+commands give this controller the same key and send to the group.
+
+- **`set_group_key`** `{ group_id, key_set_id, epoch_key }` — `epoch_key` is
+  the base64 16-byte key the members were given in key set `key_set_id`.
+  Answers `null`. Persisted (`group-keys.json` in the storage directory,
+  owner-only, apart from the fabric so a build without group support still
+  loads it) and restored at startup; the same key again writes nothing. A key
+  set is shared by the groups mapped to it: a new key under a `key_set_id`
+  replaces it for all of them.
+- **`remove_group_key`** `{ group_id }` — unmaps the group, and drops its key
+  set once no other group uses it. Answers `null`, also for a group with no
+  key.
+- **`get_group_keys`** `{}` — answers `[{ group_id, key_set_id }]` by group id,
+  for a client to check it is in sync. Keys are never returned.
+- **`group_command`** `{ group_id, node_ids, cluster_id, command_name |
+  command_id, payload }` — as `device_command`, with no endpoint: one message,
+  no response. `node_ids` are the group's members; the message goes out of
+  every interface that leads to one by its last known address. Answers
+  `{ interfaces, unaddressed_node_ids }`.
+
+rs-matter's defaults bound the controller's fabric to 3 key sets and 4 mapped
+groups; past that `set_group_key` fails and changes nothing. A
+`group-keys.json` that can't be read is logged, renamed
+`group-keys.json.corrupt`, and the server starts with no group keys.
+
 ## Migration
 
 `--import-matterjs` adopts a matterjs-server installation's fabric so that its

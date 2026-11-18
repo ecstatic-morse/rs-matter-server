@@ -92,3 +92,108 @@ fn fabric_creation_is_not_flaky() {
         failures.join("\n")
     );
 }
+
+/// Group keys come back after a restart from their own file, and that file,
+/// not the copy every `persist_fabric` also writes into the fabric blob,
+/// decides: a key removed before the restart stays removed.
+#[test]
+fn group_keys_survive_a_restart_and_removals_stick() {
+    use rs_matter_server::matter::controller::{init_controller, persist_fabric};
+    use rs_matter_server::matter::interaction::{group_keys, remove_group_key, set_group_key};
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().to_str().unwrap().to_string();
+    let config = FabricConfig::default();
+    let index = |matter: &rs_matter::Matter<'_>| {
+        matter
+            .with_state(|state| state.fabrics.iter().next().map(|f| f.fab_idx()))
+            .unwrap()
+    };
+
+    {
+        let controller = init_controller(&path, &config).expect("init");
+        let (matter, storage) = (&controller.matter, &controller.storage_path);
+        let fabric = index(matter);
+        set_group_key(matter, fabric, storage, 7, 1, &[0x11; 16]).unwrap();
+        set_group_key(matter, fabric, storage, 8, 1, &[0x11; 16]).unwrap();
+        set_group_key(matter, fabric, storage, 9, 2, &[0x22; 16]).unwrap();
+        // The fabric blob now carries all three too.
+        persist_fabric(matter, storage).unwrap();
+        remove_group_key(matter, fabric, storage, 9).unwrap();
+
+        // Setting what is there already doesn't touch the file.
+        let file = storage.join("group-keys.json");
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        set_group_key(matter, fabric, storage, 7, 1, &[0x11; 16]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            written
+        );
+    }
+
+    let controller = init_controller(&path, &config).expect("reload");
+    let keys = group_keys(&controller.matter, index(&controller.matter)).unwrap();
+    assert_eq!(
+        keys.groups.into_iter().collect::<Vec<_>>(),
+        [(7, 1), (8, 1)]
+    );
+    assert_eq!(
+        keys.key_sets.into_iter().collect::<Vec<_>>(),
+        [(1, [0x11; 16])]
+    );
+}
+
+/// A group key file that can't be read is set aside, not a reason not to
+/// start.
+#[test]
+fn a_corrupt_group_key_file_does_not_stop_startup() {
+    use rs_matter_server::matter::controller::init_controller;
+    use rs_matter_server::matter::interaction::group_keys;
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().to_str().unwrap().to_string();
+    drop(init_matter(&path, &FabricConfig::default()).expect("init"));
+    std::fs::write(tmp.path().join("group-keys.json"), "{").unwrap();
+
+    let controller = init_controller(&path, &FabricConfig::default()).expect("reload");
+    let fabric = controller
+        .matter
+        .with_state(|state| state.fabrics.iter().next().map(|f| f.fab_idx()))
+        .unwrap();
+    assert!(group_keys(&controller.matter, fabric)
+        .unwrap()
+        .groups
+        .is_empty());
+    assert!(tmp.path().join("group-keys.json.corrupt").exists());
+}
+
+/// A key the fabric has no room for is refused, and leaves the keys already
+/// there, in memory and on disk, as they were.
+#[test]
+fn a_group_key_past_the_fabric_limits_changes_nothing() {
+    use rs_matter_server::matter::controller::init_controller;
+    use rs_matter_server::matter::interaction::{group_keys, set_group_key};
+    use rs_matter_server::storage::group_keys as stored;
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().to_str().unwrap().to_string();
+    let controller = init_controller(&path, &FabricConfig::default()).expect("init");
+    let (matter, storage) = (&controller.matter, &controller.storage_path);
+    let fabric = matter
+        .with_state(|state| state.fabrics.iter().next().map(|f| f.fab_idx()))
+        .unwrap();
+
+    let mut group = 0;
+    let refused = loop {
+        group += 1;
+        assert!(group < 64, "no limit reached");
+        if let Err(error) = set_group_key(matter, fabric, storage, group, 1, &[0x11; 16]) {
+            break error;
+        }
+    };
+    assert!(refused.details.contains("group key"), "{}", refused.details);
+    let kept = group_keys(matter, fabric).unwrap();
+    assert_eq!(kept.groups.len(), group as usize - 1);
+    assert_eq!(stored::load(storage).unwrap(), kept);
+}

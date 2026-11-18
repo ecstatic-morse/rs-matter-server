@@ -177,6 +177,10 @@ pub fn init_controller_with_import(
         (key, FabricOrigin::Created)
     };
 
+    // Kept apart from the fabric blob, so a build without group support loads
+    // the fabric unchanged; see `storage::group_keys`.
+    super::interaction::restore_group_keys(&matter, storage_path);
+
     Ok(MatterController {
         matter,
         issuer_private_key,

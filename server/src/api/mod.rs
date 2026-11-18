@@ -453,6 +453,8 @@ pub const COMMANDS: &[&str] = &[
     "write_attribute",
     "device_command",
     "set_group_key",
+    "remove_group_key",
+    "get_group_keys",
     "group_command",
     "get_matter_fabrics",
     "remove_matter_fabric",
@@ -517,6 +519,8 @@ pub async fn dispatch(command: &str, args: &Args, context: CallContext<'_>) -> A
         "write_attribute" => interaction::write_attribute(args, context).await,
         "device_command" => interaction::device_command(args, context).await,
         "set_group_key" => interaction::set_group_key(args, context).await,
+        "remove_group_key" => interaction::remove_group_key(args, context).await,
+        "get_group_keys" => interaction::get_group_keys(args, context).await,
         "group_command" => interaction::group_command(args, context).await,
 
         // -- fabrics, ACLs and bindings ------------------------------------

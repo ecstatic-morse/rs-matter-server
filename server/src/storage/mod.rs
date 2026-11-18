@@ -5,6 +5,7 @@
 //! credentials, the node-id counter, the fabric label — lives here.
 
 pub mod config;
+pub mod group_keys;
 pub mod nodes;
 pub mod thread_dataset;
 

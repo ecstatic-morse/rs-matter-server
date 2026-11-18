@@ -155,12 +155,19 @@ pub enum MatterOp {
     Ping {
         node_id: u64,
     },
-    /// Give this controller a group's key, so it can send to the group.
+    /// Give this controller a group's key, so it can send to the group;
+    /// persisted.
     SetGroupKey {
         group_id: u16,
         key_set_id: u16,
         epoch_key: Vec<u8>,
     },
+    /// Take a group's key off this controller; persisted.
+    RemoveGroupKey {
+        group_id: u16,
+    },
+    /// The groups this controller has keys for, without the keys.
+    GroupKeys,
     /// One multicast command to a Matter group.
     GroupInvoke {
         group_id: u16,
@@ -207,6 +214,8 @@ impl MatterOp {
             Self::Interview { .. } => "interview",
             Self::Ping { .. } => "ping",
             Self::SetGroupKey { .. } => "set_group_key",
+            Self::RemoveGroupKey { .. } => "remove_group_key",
+            Self::GroupKeys => "group_keys",
             Self::GroupInvoke { .. } => "group_invoke",
             Self::PakeVerifier { .. } => "pake_verifier",
         }
@@ -411,6 +420,20 @@ impl MatterHandle {
         })
         .await
         .map(|_| ())
+    }
+
+    pub async fn remove_group_key(&self, group_id: u16) -> Result<(), ApiError> {
+        self.call(MatterOp::RemoveGroupKey { group_id })
+            .await
+            .map(|_| ())
+    }
+
+    /// `[{group_id, key_set_id}]`, by group id; never the keys themselves.
+    pub async fn group_keys(&self) -> Result<Value, ApiError> {
+        match self.call(MatterOp::GroupKeys).await? {
+            MatterOutcome::Json(value) => Ok(value),
+            other => Err(unexpected(other)),
+        }
     }
 
     pub async fn group_invoke(
@@ -753,8 +776,32 @@ async fn execute<C: Crypto + Clone>(
             group_id,
             key_set_id,
             epoch_key,
-        } => interaction::set_group_key(matter, fabric_index, group_id, key_set_id, &epoch_key)
-            .map(|_| MatterOutcome::Empty),
+        } => interaction::set_group_key(
+            matter,
+            fabric_index,
+            &context.storage_path,
+            group_id,
+            key_set_id,
+            &epoch_key,
+        )
+        .map(|_| MatterOutcome::Empty),
+
+        MatterOp::RemoveGroupKey { group_id } => {
+            interaction::remove_group_key(matter, fabric_index, &context.storage_path, group_id)
+                .map(|_| MatterOutcome::Empty)
+        }
+
+        MatterOp::GroupKeys => {
+            let keys = interaction::group_keys(matter, fabric_index)?;
+            Ok(MatterOutcome::Json(Value::Array(
+                keys.groups
+                    .iter()
+                    .map(|(group_id, key_set_id)| {
+                        serde_json::json!({"group_id": group_id, "key_set_id": key_set_id})
+                    })
+                    .collect(),
+            )))
+        }
 
         MatterOp::GroupInvoke {
             group_id,
