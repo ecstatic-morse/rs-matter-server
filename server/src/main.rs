@@ -85,6 +85,18 @@ struct Args {
     #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 30)]
     poll_interval_secs: u64,
 
+    /// At most how often, in seconds, attribute changes and other cached
+    /// node state are written to nodes.json. Each write is the whole file,
+    /// so on flash storage longer is kinder; what is lost to a crash is
+    /// read back from the devices. Commissioning and removal are written at
+    /// once regardless.
+    #[arg(
+        long,
+        env = "NODE_SAVE_INTERVAL_SECS",
+        default_value_t = rs_matter_server::storage::nodes::DEFAULT_WRITE_INTERVAL.as_secs()
+    )]
+    node_save_interval_secs: u64,
+
     /// Also consult the CSA test ledger for devices with test vendor ids.
     #[arg(long, env = "ENABLE_TEST_NET_DCL", default_value_t = false)]
     enable_test_net_dcl: bool,
@@ -326,7 +338,10 @@ fn serve(args: Args) -> anyhow::Result<()> {
             rs_matter_server::migrate::apply_state(import, storage)?;
         }
     }
-    let nodes = Arc::new(NodeStore::load(storage.join("nodes.json"))?);
+    let nodes = Arc::new(
+        NodeStore::load(storage.join("nodes.json"))?
+            .with_write_interval(std::time::Duration::from_secs(args.node_save_interval_secs)),
+    );
     let config = Arc::new(ConfigStore::load(storage.join("config.json"))?);
 
     // A snapshot written by an older build may hold ids above the counter;

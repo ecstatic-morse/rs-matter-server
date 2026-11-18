@@ -11,9 +11,16 @@
 //! that moves an attribute used to serialise and fsync the whole store, some
 //! 4 ms per report on a Pi's SD card and growing with node count, and a busy
 //! fabric reports far more often than that is worth. A writer thread folds
-//! everything that changed within a couple of seconds into one write, and
-//! the store is flushed on the way out so nothing pending is lost to a clean
-//! shutdown.
+//! everything that changed within the write interval (five minutes unless
+//! configured) into one write, and the store is flushed on the way out so
+//! nothing pending is lost to a clean shutdown.
+//!
+//! What goes through `save_soon` is a cache of what the devices themselves
+//! hold — attribute values, reachability, addresses — and is read back from
+//! them once subscriptions resume, so a crash costs only a stale cache until
+//! then. The interval is what the SD card pays: the whole store is rewritten
+//! each time, and a few hundred kilobytes every couple of seconds is
+//! gigabytes a day.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,9 +66,10 @@ struct Snapshot {
     nodes: Vec<StoredNode>,
 }
 
-/// How often coalesced writes go to disk at most. Long enough to fold a
-/// burst of reports into one write, short enough that a crash loses little.
-const WRITE_INTERVAL: Duration = Duration::from_secs(2);
+/// How often coalesced writes go to disk at most, unless configured with
+/// `with_write_interval`. Long, because each write is the whole store and the
+/// store is mostly a cache the devices refill (see the module docs).
+pub const DEFAULT_WRITE_INTERVAL: Duration = Duration::from_secs(300);
 /// How long the writer thread waits for more work before it stands down; a
 /// quiet fabric should not keep a thread for nothing.
 const WRITER_IDLE: Duration = Duration::from_secs(60);
@@ -86,6 +94,8 @@ pub struct NodeStore {
     wake: Condvar,
     /// How many times the file has been written, for tests and diagnostics.
     writes: AtomicUsize,
+    /// How often coalesced writes go to disk at most.
+    write_interval: Duration,
 }
 
 impl NodeStore {
@@ -122,7 +132,14 @@ impl NodeStore {
             }),
             wake: Condvar::new(),
             writes: AtomicUsize::new(0),
+            write_interval: DEFAULT_WRITE_INTERVAL,
         })
+    }
+
+    /// Write coalesced changes no more often than `interval`.
+    pub fn with_write_interval(mut self, interval: Duration) -> Self {
+        self.write_interval = interval;
+        self
     }
 
     /// Write the snapshot now, through a temporary file so an interrupted
@@ -150,7 +167,7 @@ impl NodeStore {
         Ok(())
     }
 
-    /// Write the snapshot soon: within `WRITE_INTERVAL` of the last write,
+    /// Write the snapshot soon: within the write interval of the last write,
     /// folded together with everything else that changes before then.
     ///
     /// Returns at once. A failure to write is logged by the writer thread,
@@ -464,7 +481,7 @@ pub struct InterviewDiff {
 
 /// A bridge exposes the Aggregator device type (0x000E) in some endpoint's
 /// Descriptor DeviceTypeList (cluster 29, attribute 0).
-/// The writer thread: write when dirty, no more often than `WRITE_INTERVAL`,
+/// The writer thread: write when dirty, no more often than the write interval,
 /// and stand down after `WRITER_IDLE` with nothing to do.
 ///
 /// Holds the store weakly, so it never keeps one alive; a store dropped with
@@ -486,7 +503,7 @@ fn writer_loop(weak_store: Weak<NodeStore>) {
         // Not sooner than the interval after the last write, whoever wrote.
         let due = writer
             .last_write
-            .map(|last| last + WRITE_INTERVAL)
+            .map(|last| last + store.write_interval)
             .unwrap_or_else(Instant::now);
         drop(writer);
         // Do not keep the store alive while waiting for the write interval.
@@ -751,13 +768,29 @@ mod tests {
         assert_eq!(reloaded.highest_node_id(), Some(5));
     }
 
+    /// Short enough for a test to wait out, long enough to fold a burst.
+    const TEST_INTERVAL: Duration = Duration::from_secs(2);
+
+    /// A store loaded from disk paces itself by the default interval, not
+    /// by a test's.
+    #[test]
+    fn a_loaded_store_uses_the_default_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = NodeStore::load(dir.path().join("nodes.json")).unwrap();
+        assert_eq!(store.write_interval, DEFAULT_WRITE_INTERVAL);
+    }
+
     /// A burst of changes is one write, not one per change — and the write
     /// happens, without anyone asking for it again.
     #[test]
     fn a_burst_of_soon_saves_is_one_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nodes.json");
-        let store = Arc::new(NodeStore::load(&path).unwrap());
+        let store = Arc::new(
+            NodeStore::load(&path)
+                .unwrap()
+                .with_write_interval(TEST_INTERVAL),
+        );
         store.upsert(StoredNode::new(MatterNodeData::new(1, "t".into())));
 
         for i in 0..50 {
@@ -786,7 +819,11 @@ mod tests {
     #[test]
     fn soon_saves_are_paced_by_the_last_write() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(NodeStore::load(dir.path().join("nodes.json")).unwrap());
+        let store = Arc::new(
+            NodeStore::load(dir.path().join("nodes.json"))
+                .unwrap()
+                .with_write_interval(TEST_INTERVAL),
+        );
         store.upsert(StoredNode::new(MatterNodeData::new(1, "t".into())));
 
         // An immediate save counts as the last write, so the soon-save that
