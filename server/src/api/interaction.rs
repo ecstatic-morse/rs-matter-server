@@ -210,6 +210,64 @@ pub async fn device_command(args: &Args, context: CallContext<'_>) -> ApiResult 
     Ok(response)
 }
 
+/// Give this controller a Matter group's key (an rs-matter-server extension):
+/// `group_id`, `key_set_id` and `epoch_key` (base64, 16 bytes), the same key
+/// set the group's members were given with `KeySetWrite`. Kept in memory only.
+pub async fn set_group_key(args: &Args, context: CallContext<'_>) -> ApiResult {
+    use base64::Engine as _;
+
+    let group_id = args
+        .u16("group_id")?
+        .ok_or_else(|| ApiError::invalid_args("Missing group_id"))?;
+    let key_set_id = args
+        .u16("key_set_id")?
+        .ok_or_else(|| ApiError::invalid_args("Missing key_set_id"))?;
+    let epoch_key = args
+        .str("epoch_key")?
+        .ok_or_else(|| ApiError::invalid_args("Missing epoch_key"))?;
+    let epoch_key = base64::engine::general_purpose::STANDARD
+        .decode(epoch_key)
+        .map_err(|_| ApiError::invalid_args("epoch_key must be base64"))?;
+    context
+        .server
+        .matter
+        .set_group_key(group_id, key_set_id, epoch_key)
+        .await?;
+    Ok(Value::Null)
+}
+
+/// Send a command to a Matter group as one multicast message (an
+/// rs-matter-server extension): `group_id`, `cluster_id`, `command_name` (or
+/// `command_id`) and `payload`, as for `device_command` but with no endpoint
+/// or node. Returns once the message is out; members don't answer.
+pub async fn group_command(args: &Args, context: CallContext<'_>) -> ApiResult {
+    let group_id = args
+        .u16("group_id")?
+        .ok_or_else(|| ApiError::invalid_args("Missing group_id"))?;
+    let cluster = args
+        .u32("cluster_id")?
+        .ok_or_else(|| ApiError::invalid_args("Missing cluster_id"))?;
+    let payload = args.value("payload").unwrap_or(Value::Null);
+    let name = args.str("command_name")?;
+    let numeric_id = args.u32("command_id")?;
+    let command = clusters::cluster(cluster)
+        .and_then(|cluster| {
+            name.and_then(|name| cluster.command(name))
+                .or_else(|| numeric_id.and_then(|id| cluster.command_by_id(id)))
+        })
+        .ok_or_else(|| ApiError::invalid_args("Unknown command"))?;
+    let encoded = tlv_json::command_payload_from_json(command, &payload)?;
+    if !matches!(encoded, TlvNode::Struct(_)) {
+        return Err(ApiError::invalid_args("payload must be an object"));
+    }
+    context
+        .server
+        .matter
+        .group_invoke(group_id, cluster, command.id, encoded)
+        .await?;
+    Ok(Value::Null)
+}
+
 /// Timed interactions are requested in milliseconds and capped at what the
 /// Interaction Model can carry.
 fn timed_timeout(args: &Args) -> Result<Option<u16>, ApiError> {

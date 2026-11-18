@@ -155,6 +155,19 @@ pub enum MatterOp {
     Ping {
         node_id: u64,
     },
+    /// Give this controller a group's key, so it can send to the group.
+    SetGroupKey {
+        group_id: u16,
+        key_set_id: u16,
+        epoch_key: Vec<u8>,
+    },
+    /// One multicast command to a Matter group.
+    GroupInvoke {
+        group_id: u16,
+        cluster: u32,
+        command: u32,
+        payload: TlvNode,
+    },
     /// Derive a PAKE verifier for an enhanced commissioning window. It needs
     /// the actor's crypto backend, but touches no radio.
     PakeVerifier {
@@ -193,6 +206,8 @@ impl MatterOp {
             Self::Invoke { .. } => "invoke",
             Self::Interview { .. } => "interview",
             Self::Ping { .. } => "ping",
+            Self::SetGroupKey { .. } => "set_group_key",
+            Self::GroupInvoke { .. } => "group_invoke",
             Self::PakeVerifier { .. } => "pake_verifier",
         }
     }
@@ -381,6 +396,38 @@ impl MatterHandle {
             MatterOutcome::Json(value) => Ok(value),
             other => Err(unexpected(other)),
         }
+    }
+
+    pub async fn set_group_key(
+        &self,
+        group_id: u16,
+        key_set_id: u16,
+        epoch_key: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        self.call(MatterOp::SetGroupKey {
+            group_id,
+            key_set_id,
+            epoch_key,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn group_invoke(
+        &self,
+        group_id: u16,
+        cluster: u32,
+        command: u32,
+        payload: TlvNode,
+    ) -> Result<(), ApiError> {
+        self.call(MatterOp::GroupInvoke {
+            group_id,
+            cluster,
+            command,
+            payload,
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn interview(&self, node_id: u64) -> Result<AttributesData, ApiError> {
@@ -701,6 +748,31 @@ async fn execute<C: Crypto + Clone>(
                 .await
                 .map(|_| MatterOutcome::Empty)
         }
+
+        MatterOp::SetGroupKey {
+            group_id,
+            key_set_id,
+            epoch_key,
+        } => interaction::set_group_key(matter, fabric_index, group_id, key_set_id, &epoch_key)
+            .map(|_| MatterOutcome::Empty),
+
+        MatterOp::GroupInvoke {
+            group_id,
+            cluster,
+            command,
+            payload,
+        } => interaction::group_invoke(
+            matter,
+            context.crypto.clone(),
+            &context.storage_path,
+            fabric_index,
+            group_id,
+            cluster,
+            command,
+            payload,
+        )
+        .await
+        .map(|_| MatterOutcome::Empty),
 
         MatterOp::PakeVerifier {
             passcode,

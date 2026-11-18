@@ -424,6 +424,80 @@ pub async fn invoke<C: Crypto>(
     Ok(result)
 }
 
+/// Send a command to a Matter group: one multicast message to the group's
+/// address, encrypted with its operational key, with no response and no
+/// retransmission. Members apply it to every endpoint they put in the group.
+///
+/// The group's key set and key map entry must already be on the fabric (see
+/// [`set_group_key`]). `storage_path` holds the group message counter, which
+/// rs-matter stores before using so a restart never repeats one.
+#[allow(clippy::too_many_arguments)]
+pub async fn group_invoke<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: C,
+    storage_path: &std::path::Path,
+    fabric_index: NonZeroU8,
+    group_id: u16,
+    cluster: u32,
+    command: u32,
+    payload: TlvNode,
+) -> Result<(), ApiError> {
+    let kv = matter.kv(rs_matter::persist::DirKvBlobStore::new(
+        storage_path.to_path_buf(),
+    ));
+    let exchange = Exchange::initiate_group(matter, crypto, &kv, fabric_index, group_id)
+        .map_err(|e| im_error("group exchange", e))?;
+    let path = rs_matter::im::CmdPath::new(None, Some(cluster), Some(command));
+    exchange
+        .group_invoke_with(|requests| {
+            requests
+                .push()?
+                .path_from(&path)?
+                .data(|w| payload.write(w, &TLVTag::Context(1)))?
+                .end()
+        })
+        .await
+        .map_err(|e| im_error("group invoke", e))
+}
+
+/// Put a group's key on this controller's own fabric, so it can encrypt
+/// messages to the group: key set `key_set_id` holding `epoch_key` (16
+/// bytes), mapped to `group_id`. In memory only: not persisted.
+pub fn set_group_key(
+    matter: &Matter<'_>,
+    fabric_index: NonZeroU8,
+    group_id: u16,
+    key_set_id: u16,
+    epoch_key: &[u8],
+) -> Result<(), ApiError> {
+    use rs_matter::group_keys::{GroupEpochKeyEntry, GroupKeySet};
+
+    let mut key = GroupEpochKeyEntry {
+        epoch_key: Default::default(),
+        // As rs-matter's own Groupcast cluster does; the device gets the same.
+        epoch_start_time: 1,
+    };
+    key.epoch_key
+        .try_load_from_slice(epoch_key)
+        .map_err(|_| ApiError::invalid_args("epoch_key must be 16 bytes"))?;
+    let mut set = GroupKeySet {
+        group_key_set_id: key_set_id,
+        // TrustFirst.
+        group_key_security_policy: 0,
+        ..Default::default()
+    };
+    set.epoch_keys
+        .push(key)
+        .map_err(|_| ApiError::sdk("epoch key list full"))?;
+    matter
+        .with_state(|state| {
+            let groups = state.fabrics.fabric_mut(fabric_index)?.groups_mut();
+            groups.key_set_add(set)?;
+            groups.key_map_set_group(group_id, key_set_id)
+        })
+        .map_err(|e| im_error("group key", e))
+}
+
 /// Basic Information lives on the root endpoint of every node, and
 /// `ClusterRevision` is a global attribute every cluster carries: the one path
 /// a controller can read from any device without knowing anything about it.
