@@ -11,9 +11,10 @@
 //! that moves an attribute used to serialise and fsync the whole store, some
 //! 4 ms per report on a Pi's SD card and growing with node count, and a busy
 //! fabric reports far more often than that is worth. A writer thread folds
-//! everything that changed within the write interval (five minutes unless
-//! configured) into one write, and the store is flushed on the way out so
-//! nothing pending is lost to a clean shutdown.
+//! everything that changed within the write interval (an hour unless
+//! configured) into one write, and the store is flushed on the way out —
+//! SIGTERM and SIGINT included — so nothing pending is lost to a clean
+//! shutdown.
 //!
 //! What goes through `save_soon` is a cache of what the devices themselves
 //! hold — attribute values, reachability, addresses — and is read back from
@@ -69,7 +70,7 @@ struct Snapshot {
 /// How often coalesced writes go to disk at most, unless configured with
 /// `with_write_interval`. Long, because each write is the whole store and the
 /// store is mostly a cache the devices refill (see the module docs).
-pub const DEFAULT_WRITE_INTERVAL: Duration = Duration::from_secs(300);
+pub const DEFAULT_WRITE_INTERVAL: Duration = Duration::from_secs(3600);
 /// How long the writer thread waits for more work before it stands down; a
 /// quiet fabric should not keep a thread for nothing.
 const WRITER_IDLE: Duration = Duration::from_secs(60);

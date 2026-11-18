@@ -55,7 +55,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # `all` is required for set_reuse_port, which the Linux mDNS socket needs to
 # share port 5353 with the host's own responder.
 socket2 = { version = "0.5", features = ["all"] }
-nix = { version = "0.30", features = ["net"] }
+nix = { version = "0.30", features = ["net", "signal"] }
 # `umask`, so every file the process creates — including the ones rs-matter
 # writes itself — is private without having to chmod each one after the fact.
 libc = "0.2"

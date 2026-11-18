@@ -108,7 +108,7 @@ Every option is a flag or an environment variable.
 | `--import-matterjs-dry-run` | — | — | Report what would be imported, then exit |
 | `--log-level` | `LOG_LEVEL` | `info` | `error`, `warning`, `info`, `debug` |
 | `--poll-interval-secs` | `POLL_INTERVAL_SECS` | `30` | How often a reachable node is re-read |
-| `--node-save-interval-secs` | `NODE_SAVE_INTERVAL_SECS` | `300` | At most how often cached node state (attributes, reachability) is written to `nodes.json`; commissioning and removal are written at once |
+| `--node-save-interval-secs` | `NODE_SAVE_INTERVAL_SECS` | `3600` | At most how often cached node state (attributes, reachability) is written to `nodes.json`; commissioning and removal are written at once |
 | `--default-fabric-label` | `DEFAULT_FABRIC_LABEL` | — | Pin the fabric label, ignoring clients |
 | `--disable-ota` | `DISABLE_OTA` | off | Turn off update checks and the upload endpoint |
 | `--disable-thread-diagnostics` | `DISABLE_THREAD_DIAGNOSTICS` | off | Turn off Thread discovery |

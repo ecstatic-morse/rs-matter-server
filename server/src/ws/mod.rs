@@ -49,12 +49,15 @@ pub struct ServerConfig {
     pub ws_auth: Option<auth::AuthToken>,
 }
 
-/// Start the server and run until the Matter transport stops.
+/// Start the server and run until the Matter transport stops or `stop`
+/// resolves, then shut down: clients are told, and node state not yet on
+/// disk is written.
 pub async fn run(
     config: ServerConfig,
     controller: MatterController,
     nodes: Arc<NodeStore>,
     store: Arc<ConfigStore>,
+    stop: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let listener = TcpListener::bind(config.listen)?;
     listener.set_nonblocking(true)?;
@@ -183,7 +186,7 @@ pub async fn run(
         actor::run(actor_context, requests),
         accept_loop(listener, shutdown.clone(), context.clone()),
     );
-    futures_lite::future::or(network, work).await;
+    futures_lite::future::or(futures_lite::future::or(network, work), stop).await;
 
     // Tell every listening client before the socket goes away; a client that
     // sees this reconnects instead of waiting for a timeout.

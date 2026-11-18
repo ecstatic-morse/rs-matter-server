@@ -272,17 +272,19 @@ fn main() -> anyhow::Result<()> {
     // thread's size is fixed by the time this runs. Nothing crosses into it
     // but `Args` — the Matter stack is not `Send`, so it is built over there.
     const SERVER_STACK_SIZE: usize = 64 * 1024 * 1024;
+    // Before the server thread starts, so that it inherits the signal mask.
+    let stop = stop_on_signal()?;
     std::thread::Builder::new()
         .name("rs-matter-server".into())
         .stack_size(SERVER_STACK_SIZE)
-        .spawn(move || serve(args))
+        .spawn(move || serve(args, stop))
         .map_err(|error| anyhow::anyhow!("starting the server thread: {}", error))?
         .join()
         .map_err(|_| anyhow::anyhow!("the server thread panicked"))?
 }
 
 /// Everything from the fabric onwards, on the server thread.
-fn serve(args: Args) -> anyhow::Result<()> {
+fn serve(args: Args, stop: async_std::channel::Receiver<()>) -> anyhow::Result<()> {
     // Before anything else, so a token that cannot be read stops the server
     // instead of leaving it running open.
     let ws_auth = ws::auth::load(
@@ -374,5 +376,49 @@ fn serve(args: Args) -> anyhow::Result<()> {
         ws_auth,
     };
 
-    async_std::task::block_on(ws::run(server, controller, nodes, config))
+    async_std::task::block_on(ws::run(server, controller, nodes, config, async move {
+        // A sender gone without a signal is no reason to stop.
+        if stop.recv().await.is_err() {
+            futures_lite::future::pending::<()>().await;
+        }
+    }))
+}
+
+/// Turn SIGTERM and SIGINT into a stop request.
+///
+/// Without this a stop kills the process where it stands, and whatever node
+/// state is waiting for the next coalesced write is lost. Instead both signals
+/// are blocked in every thread and waited for on one of their own, which asks
+/// the server to shut down the ordinary way: clients are told and pending node
+/// state is written. A second signal exits at once, for a shutdown that hangs.
+///
+/// Must be called before any other thread starts: a thread takes its signal
+/// mask from the thread that creates it.
+fn stop_on_signal() -> anyhow::Result<async_std::channel::Receiver<()>> {
+    use nix::sys::signal::{SigSet, Signal};
+
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGTERM);
+    signals.add(Signal::SIGINT);
+    signals.thread_block()?;
+
+    let (tx, rx) = async_std::channel::bounded(1);
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            let signal = match signals.wait() {
+                Ok(signal) => signal,
+                Err(error) => {
+                    log::error!("Waiting for a stop signal failed: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            log::info!("{} received, shutting down", signal.as_str());
+            let _ = tx.send_blocking(());
+            if let Ok(signal) = signals.wait() {
+                log::warn!("{} received again, exiting at once", signal.as_str());
+                std::process::exit(1);
+            }
+        })?;
+    Ok(rx)
 }
